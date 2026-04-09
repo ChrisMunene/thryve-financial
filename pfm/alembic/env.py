@@ -4,8 +4,11 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import settings
+from app.config import get_settings
 from app.models.base import Base
+
+# Import all models here so autogenerate sees them
+# from app.models.user import User  # noqa: F401 — uncomment as models are added
 
 config = context.config
 if config.config_file_name is not None:
@@ -15,8 +18,12 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = settings.database_url
-    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    settings = get_settings()
+    context.configure(
+        url=settings.database.url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
@@ -28,7 +35,8 @@ def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
 
 
 async def run_async_migrations() -> None:
-    engine = create_async_engine(settings.database_url)
+    settings = get_settings()
+    engine = create_async_engine(settings.database.url)
     async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await engine.dispose()

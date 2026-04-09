@@ -21,8 +21,26 @@ dependencies = [
     # Background tasks
     "celery[redis]>=5.4.0",
 
+    # Auth
+    "PyJWT[crypto]>=2.9.0",
+
+    # Logging
+    "structlog>=25.0.0",
+    "asgi-correlation-id>=4.3.4",
+
     # LLM
     "anthropic>=0.42.0",
+
+    # Observability
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+    "opentelemetry-instrumentation-redis>=0.48b0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+
+    # Analytics
+    "posthog>=3.7.0",
 
     # Plaid
     "plaid-python>=27.0.0",

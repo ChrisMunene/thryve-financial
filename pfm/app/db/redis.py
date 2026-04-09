@@ -2,8 +2,11 @@ import json
 from typing import Any
 
 import redis.asyncio as aioredis
+import structlog
 
-from app.config import settings
+from app.config import get_settings
+
+logger = structlog.get_logger()
 
 
 class RedisClient:
@@ -11,9 +14,23 @@ class RedisClient:
         self._redis: aioredis.Redis | None = None
 
     async def initialize(self) -> None:
-        self._redis = aioredis.from_url(
-            settings.redis_url, encoding="utf-8", decode_responses=True
+        settings = get_settings()
+        redis = aioredis.from_url(
+            settings.redis.url,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_timeout=5.0,
+            socket_connect_timeout=5.0,
         )
+        try:
+            await redis.ping()
+        except Exception as exc:
+            logger.warning("redis.initialize_failed", error=str(exc))
+            await redis.close()
+            self._redis = None
+            return
+
+        self._redis = redis
 
     async def close(self) -> None:
         if self._redis:
