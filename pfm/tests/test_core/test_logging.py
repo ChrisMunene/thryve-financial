@@ -2,11 +2,14 @@
 
 from app.core.context import (
     clear_correlation_id,
+    clear_current_user_id,
     generate_correlation_id,
     get_correlation_id,
+    get_current_user_id,
     set_correlation_id,
+    set_current_user_id,
 )
-from app.core.logging import redact_sensitive_fields
+from app.core.logging import add_current_user_id, redact_sensitive_fields
 
 
 class TestSensitiveRedaction:
@@ -68,3 +71,18 @@ class TestCorrelationId:
     def test_get_returns_none_when_unset(self):
         clear_correlation_id()
         assert get_correlation_id() is None
+
+
+class TestCurrentUserId:
+    def test_set_and_get(self):
+        set_current_user_id("user-123")
+        assert get_current_user_id() == "user-123"
+
+    def test_get_returns_none_when_cleared(self):
+        clear_current_user_id()
+        assert get_current_user_id() is None
+
+    def test_logging_processor_adds_current_user_id(self):
+        set_current_user_id("user-123")
+        event = add_current_user_id(None, "", {"event": "test"})
+        assert event["current_user_id"] == "user-123"

@@ -18,6 +18,7 @@ from app.middleware.correlation import (
 )
 from app.middleware.error_handler import register_error_handlers
 from app.middleware.operational import BodySizeLimitMiddleware, RequestTimeoutMiddleware
+from app.middleware.user_context import UserContextMiddleware
 
 logger = structlog.get_logger()
 
@@ -98,6 +99,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestTimeoutMiddleware, timeout_seconds=settings.request_timeout)
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=settings.request_max_body_size)
     app.add_middleware(SecurityHeadersMiddleware, is_production=settings.is_production)
+    app.add_middleware(UserContextMiddleware)
     app.add_middleware(
         CorrelationIdMiddleware,
         header_name="X-Request-ID",

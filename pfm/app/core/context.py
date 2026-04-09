@@ -37,3 +37,7 @@ def get_current_user_id() -> str | None:
 
 def set_current_user_id(value: str) -> None:
     _current_user_id.set(value)
+
+
+def clear_current_user_id() -> None:
+    _current_user_id.set(None)

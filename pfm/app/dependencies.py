@@ -55,6 +55,7 @@ async def get_current_user(
         raise AuthenticationError("Empty token")
 
     current_user = await auth_service.authenticate(token)
+    request.state.current_user = current_user
     request.state.user_id = str(current_user.user_id)
     return current_user
 

@@ -57,6 +57,18 @@ def add_correlation_id(
     return event_dict
 
 
+def add_current_user_id(
+    logger: Any, method_name: str, event_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """Processor that adds the authenticated user ID from request-local context."""
+    from app.core.context import get_current_user_id
+
+    current_user_id = get_current_user_id()
+    if current_user_id:
+        event_dict["current_user_id"] = current_user_id
+    return event_dict
+
+
 def configure_logging(environment: Environment, log_level: str) -> None:
     """Configure structlog for the given environment."""
     level = getattr(logging, log_level.upper(), logging.INFO)
@@ -68,6 +80,7 @@ def configure_logging(environment: Environment, log_level: str) -> None:
         structlog.stdlib.add_logger_name,
         add_service_context,
         add_correlation_id,
+        add_current_user_id,
         redact_sensitive_fields,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),

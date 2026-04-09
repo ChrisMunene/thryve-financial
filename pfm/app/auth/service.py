@@ -42,14 +42,14 @@ class AuthService:
             logger.error("authentication.error", error=str(e))
             raise AuthenticationError("Authentication failed") from e
 
-        # Set user context for logging
-        set_current_user_id(payload.user_id)
-
         try:
             user_uuid = uuid.UUID(payload.user_id)
         except (ValueError, AttributeError):
             logger.warning("authentication.failed", reason="malformed_user_id")
             raise AuthenticationError("Invalid user ID in token")
+
+        # Mirror the validated user ID into request-local context for logs/telemetry.
+        set_current_user_id(str(user_uuid))
 
         user = CurrentUser(
             user_id=user_uuid,

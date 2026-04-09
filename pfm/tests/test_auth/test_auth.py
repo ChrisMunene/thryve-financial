@@ -4,13 +4,16 @@ import uuid
 
 import jwt
 import pytest
+from fastapi import Depends, Request
 
 from app.auth.delegate import TokenPayload
 from app.auth.mock import MockAuthDelegate
 from app.auth.schemas import CurrentUser
 from app.auth.service import AuthService
 from app.auth.supabase import SupabaseAuthDelegate
+from app.core.context import clear_current_user_id, get_current_user_id
 from app.core.exceptions import AuthenticationError, AuthorizationError
+from app.dependencies import get_current_user
 
 
 # --- Mock Delegate ---
@@ -106,6 +109,7 @@ class TestSupabaseDelegate:
 
 class TestAuthService:
     async def test_authenticate_returns_current_user(self):
+        clear_current_user_id()
         delegate = MockAuthDelegate(
             user_id="550e8400-e29b-41d4-a716-446655440000",
             email="chris@example.com",
@@ -116,6 +120,7 @@ class TestAuthService:
         assert isinstance(user, CurrentUser)
         assert str(user.user_id) == "550e8400-e29b-41d4-a716-446655440000"
         assert user.email == "chris@example.com"
+        assert get_current_user_id() == "550e8400-e29b-41d4-a716-446655440000"
 
     async def test_authenticate_propagates_auth_error(self):
         class FailingDelegate:
@@ -138,6 +143,58 @@ class TestAuthService:
         service = AuthService(delegate=BrokenDelegate())
         with pytest.raises(AuthenticationError, match="Authentication failed"):
             await service.authenticate("any-token")
+
+    async def test_authenticate_does_not_set_context_for_invalid_user_id(self):
+        clear_current_user_id()
+        delegate = MockAuthDelegate(user_id="not-a-uuid")
+        service = AuthService(delegate=delegate)
+
+        with pytest.raises(AuthenticationError, match="Invalid user ID"):
+            await service.authenticate("any-token")
+
+        assert get_current_user_id() is None
+
+
+class TestAuthDependencyContext:
+    async def test_dependency_sets_request_state_user_context(self, app, client):
+        @app.get("/me-context")
+        async def me_context(
+            request: Request,
+            current_user: CurrentUser = Depends(get_current_user),
+        ):
+            return {
+                "dependency_user_id": str(current_user.user_id),
+                "state_user_id": request.state.user_id,
+                "state_current_user_id": str(request.state.current_user.user_id),
+            }
+
+        response = await client.get(
+            "/me-context",
+            headers={"authorization": "Bearer token-123"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["dependency_user_id"] == response.json()["state_user_id"]
+        assert response.json()["state_current_user_id"] == response.json()["state_user_id"]
+
+    async def test_user_context_is_cleared_between_requests(self, app, client):
+        @app.get("/me-context")
+        async def me_context(current_user: CurrentUser = Depends(get_current_user)):
+            return {"user_id": str(current_user.user_id)}
+
+        @app.get("/context-peek")
+        async def context_peek():
+            return {"current_user_id": get_current_user_id()}
+
+        first = await client.get(
+            "/me-context",
+            headers={"authorization": "Bearer token-123"},
+        )
+        second = await client.get("/context-peek")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json() == {"current_user_id": None}
 
 
 # --- CurrentUser ---
