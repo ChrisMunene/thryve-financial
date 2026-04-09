@@ -3,12 +3,12 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from importlib.metadata import version
 import structlog
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.core.logging import configure_logging
-from app.core.rate_limit import RateLimitMiddleware
+from app.core.rate_limit import RateLimitTier, initialize_rate_limiting, rate_limit
 from app.core.security import SecurityHeadersMiddleware
 from app.core.telemetry import configure_telemetry, instrument_app, shutdown_telemetry
 from app.middleware.correlation import (
@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # 3. Initialize Redis
     from app.db.redis import redis_client
     await redis_client.initialize()
+    await initialize_rate_limiting()
 
     # TODO: Load pattern rules into memory
     # TODO: Load few-shot pool into memory
@@ -92,10 +93,8 @@ def create_app() -> FastAPI:
     )
 
     # --- Middleware ---
-    # FastAPI makes later-added middleware outermost. Add the early-returning
-    # middleware first so correlation IDs, security headers, and CORS still
-    # apply to timeout, body-limit, and rate-limit responses.
-    app.add_middleware(RateLimitMiddleware, default_limit=settings.rate_limit_default, window=60)
+    # FastAPI makes later-added middleware outermost. Keep CORS outermost and
+    # correlation/user context outside the operational middleware.
     app.add_middleware(RequestTimeoutMiddleware, timeout_seconds=settings.request_timeout)
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=settings.request_max_body_size)
     app.add_middleware(SecurityHeadersMiddleware, is_production=settings.is_production)
@@ -121,7 +120,11 @@ def create_app() -> FastAPI:
 
     # --- Routers ---
     from app.api.router import api_router
-    app.include_router(api_router, prefix="/api/v1")
+    app.include_router(
+        api_router,
+        prefix="/api/v1",
+        dependencies=[Depends(rate_limit(RateLimitTier.DEFAULT))],
+    )
 
     return app
 

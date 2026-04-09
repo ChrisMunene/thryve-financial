@@ -16,9 +16,11 @@ class AppException(Exception):
         self,
         message: str = "An unexpected error occurred",
         details: list[str] | None = None,
+        headers: dict[str, str] | None = None,
     ):
         self.message = message
         self.details = details
+        self.headers = headers or {}
         super().__init__(message)
 
 

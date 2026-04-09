@@ -49,6 +49,7 @@ def register_error_handlers(app: FastAPI, debug: bool = False) -> None:
                 details=exc.details,
                 request_id=correlation_id,
             ).model_dump(),
+            headers=exc.headers,
         )
 
     @app.exception_handler(Exception)

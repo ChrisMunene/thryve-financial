@@ -27,6 +27,7 @@ dependencies = [
     # Logging
     "structlog>=25.0.0",
     "asgi-correlation-id>=4.3.4",
+    "fastapi-limiter>=0.2.0",
 
     # LLM
     "anthropic>=0.42.0",

@@ -1,37 +1,102 @@
 """
-Rate limiting — Redis sliding window counter.
+Rate limiting adapters built on top of ``fastapi-limiter``.
 
-Per-user limits (by user_id or IP). Per-endpoint limits via dependency.
-Returns 429 with Retry-After and X-RateLimit-* headers on exceed.
+The package provides the limiting mechanics; this module owns app policy:
+identity selection, error envelopes, and fail-open behavior.
+
+Public route API:
+    `Depends(rate_limit(RateLimitTier.X))`
+
+Everything else in this module is an internal implementation detail.
 """
 
 import hashlib
-import time
-from typing import Any
+from dataclasses import dataclass
+from enum import Enum
 
 import structlog
-from fastapi import Depends, Request, Response
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from fastapi import Request, Response
+from fastapi_limiter.decorators import skip_limiter
+from fastapi_limiter.depends import RateLimiter as PackageRateLimiter
+from pyrate_limiter import Limiter, Rate, RedisBucket
 
+from app.config import Settings, get_settings
 from app.core.exceptions import RateLimitError
-from app.core.responses import error_response
 from app.db.redis import redis_client
 
 logger = structlog.get_logger()
-_UNLIMITED_PATHS = {
-    "/health",
-    "/health/ready",
-    "/api/v1/health",
-    "/api/v1/health/ready",
-}
 
 
-def _is_unlimited_path(path: str) -> bool:
-    return path in _UNLIMITED_PATHS
+@dataclass(frozen=True)
+class RateLimitPolicy:
+    """A requests-per-window rule applied to a route or router."""
+
+    limit: int
+    window_seconds: int
+
+_LIMITER_INSTANCE_CACHE: dict[RateLimitPolicy, Limiter] = {}
 
 
-def _resolve_request_identity(request: Request) -> str:
+class RateLimitTier(str, Enum):
+    DEFAULT = "default"
+    WRITE = "write"
+    EXPENSIVE = "expensive"
+    AUTH = "auth"
+    EXEMPT = "exempt"
+
+
+@dataclass(frozen=True)
+class RateLimitPolicies:
+    """Internal named policy registry for the application."""
+
+    default: RateLimitPolicy
+    write: RateLimitPolicy
+    expensive: RateLimitPolicy
+    auth: RateLimitPolicy
+
+
+def _build_rate_limit_policies(settings: Settings) -> RateLimitPolicies:
+    """Build the full named tier registry from application settings."""
+    return RateLimitPolicies(
+        default=RateLimitPolicy(
+            limit=settings.rate_limit.default_limit,
+            window_seconds=settings.rate_limit.default_window_seconds,
+        ),
+        write=RateLimitPolicy(
+            limit=settings.rate_limit.write_limit,
+            window_seconds=settings.rate_limit.write_window_seconds,
+        ),
+        expensive=RateLimitPolicy(
+            limit=settings.rate_limit.expensive_limit,
+            window_seconds=settings.rate_limit.expensive_window_seconds,
+        ),
+        auth=RateLimitPolicy(
+            limit=settings.rate_limit.auth_limit,
+            window_seconds=settings.rate_limit.auth_window_seconds,
+        ),
+    )
+
+
+def _get_rate_limit_policies() -> RateLimitPolicies:
+    """Return the named policy registry for the current runtime settings."""
+    return _build_rate_limit_policies(get_settings())
+
+
+def _policy_for_tier(tier: RateLimitTier) -> RateLimitPolicy | None:
+    policies = _get_rate_limit_policies()
+    if tier == RateLimitTier.DEFAULT:
+        return policies.default
+    if tier == RateLimitTier.WRITE:
+        return policies.write
+    if tier == RateLimitTier.EXPENSIVE:
+        return policies.expensive
+    if tier == RateLimitTier.AUTH:
+        return policies.auth
+    if tier == RateLimitTier.EXEMPT:
+        return None
+    raise ValueError(f"Unsupported rate limit tier: {tier}")
+
+async def _resolve_rate_limit_identity(request: Request) -> str:
     user_id = getattr(request.state, "user_id", None)
     if user_id:
         return f"user:{user_id}"
@@ -42,122 +107,129 @@ def _resolve_request_identity(request: Request) -> str:
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         return f"token:{token_hash}"
 
-    return request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return f"ip:{forwarded.split(',')[0].strip()}"
+
+    return f"ip:{request.client.host}" if request.client else "ip:unknown"
 
 
-async def _check_rate_limit(key: str, limit: int, window: int) -> dict[str, int]:
-    """Sliding window rate limit check.
-
-    Returns limit metadata for the current request.
-    Raises RateLimitError if exceeded.
-    """
-    if limit <= 0:
-        raise ValueError("Rate limit 'limit' must be greater than 0")
-    if window <= 0:
-        raise ValueError("Rate limit 'window' must be greater than 0")
-
-    redis = redis_client.redis
-    now = time.time()
-    window_start = now - window + 1
-
-    async with redis.pipeline() as pipe:
-        # Remove expired entries
-        pipe.zremrangebyscore(key, 0, window_start)
-        # Add current request
-        pipe.zadd(key, {str(now): now})
-        # Count requests in window
-        pipe.zcard(key)
-        # Set TTL on the key
-        pipe.expire(key, window)
-
-        results = await pipe.execute()
-    request_count = results[2]
-
-    remaining = max(0, limit - request_count)
-    reset_at = int(now + window)
-    retry_after = max(1, int(reset_at - now))
-    metadata = {
-        "remaining": remaining,
-        "limit": limit,
-        "reset_at": reset_at,
-        "retry_after": retry_after,
+def _rate_limit_headers(policy: RateLimitPolicy) -> dict[str, str]:
+    return {
+        "Retry-After": str(policy.window_seconds),
+        "X-RateLimit-Limit": str(policy.limit),
     }
 
-    if request_count >= limit:
-        raise RateLimitError(
-            message=f"Rate limit exceeded. Try again in {retry_after} seconds.",
-            details=[str(reset_at), str(retry_after)],
+
+async def _on_rate_limit_exceeded(request: Request, response: Response, policy: RateLimitPolicy):
+    raise RateLimitError(
+        message=f"Rate limit exceeded. Try again in {policy.window_seconds} seconds.",
+        headers=_rate_limit_headers(policy),
+        details=[str(policy.window_seconds)],
+    )
+
+
+def _get_or_create_limiter(policy: RateLimitPolicy) -> Limiter | None:
+    if policy.limit <= 0 or policy.window_seconds <= 0:
+        raise ValueError("Rate limit policy values must be greater than 0")
+
+    cached = _LIMITER_INSTANCE_CACHE.get(policy)
+    if cached is not None:
+        return cached
+
+    try:
+        bucket = RedisBucket.init(
+            [Rate(policy.limit, policy.window_seconds)],
+            redis_client.redis,
+            bucket_key=f"pfm-rate-limit:{policy.limit}:{policy.window_seconds}",
         )
+    except Exception as exc:
+        logger.warning(
+            "rate_limit.unavailable",
+            error=str(exc),
+            limit=policy.limit,
+            window_seconds=policy.window_seconds,
+        )
+        return None
 
-    return metadata
-
-
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Global per-user rate limiting middleware."""
-
-    def __init__(self, app: Any, default_limit: int = 100, window: int = 60) -> None:
-        super().__init__(app)
-        self._default_limit = default_limit
-        self._window = window
-
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if _is_unlimited_path(request.url.path):
-            return await call_next(request)
-
-        identity = _resolve_request_identity(request)
-        key = f"ratelimit:global:{identity}"
-
-        try:
-            metadata = await _check_rate_limit(
-                key, self._default_limit, self._window
-            )
-        except RateLimitError as e:
-            reset_at = int(e.details[0]) if e.details else int(time.time()) + self._window
-            retry_after = int(e.details[1]) if e.details else self._window
-
-            return JSONResponse(
-                status_code=429,
-                content=error_response(
-                    code="RATE_LIMIT_EXCEEDED",
-                    message=e.message,
-                ).model_dump(),
-                headers={
-                    "Retry-After": str(retry_after),
-                    "X-RateLimit-Limit": str(self._default_limit),
-                    "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset": str(reset_at),
-                },
-            )
-        except Exception as exc:
-            logger.warning("rate_limit.unavailable", error=str(exc), key=key)
-            return await call_next(request)
-
-        response = await call_next(request)
-
-        # Add rate limit headers to every response
-        response.headers["X-RateLimit-Limit"] = str(self._default_limit)
-        response.headers["X-RateLimit-Remaining"] = str(metadata["remaining"])
-        response.headers["X-RateLimit-Reset"] = str(metadata["reset_at"])
-
-        return response
+    limiter = Limiter(bucket)
+    _LIMITER_INSTANCE_CACHE[policy] = limiter
+    return limiter
 
 
-def rate_limit(limit: int = 10, window: int = 60):
-    """Per-endpoint rate limit dependency.
+async def initialize_rate_limiting() -> None:
+    """Warm the process-local limiter instance cache once Redis is initialized."""
+    _LIMITER_INSTANCE_CACHE.clear()
+    policies = _get_rate_limit_policies().__dict__.values()
+    for policy in policies:
+        _get_or_create_limiter(policy)
 
-    Usage:
-        @router.post("/expensive", dependencies=[Depends(rate_limit(limit=10, window=60))])
-    """
 
-    async def _check(request: Request) -> None:
-        identity = _resolve_request_identity(request)
-        key = f"ratelimit:endpoint:{request.url.path}:{identity}"
-        try:
-            metadata = await _check_rate_limit(key, limit, window)
-        except Exception as exc:
-            logger.warning("rate_limit.endpoint_unavailable", error=str(exc), key=key)
+class _AppRateLimiter:
+    """Thin FastAPI dependency wrapper around ``fastapi-limiter``."""
+
+    def __init__(self, policy: RateLimitPolicy) -> None:
+        self._policy = policy
+
+    async def __call__(self, request: Request, response: Response) -> None:
+        limiter = _get_or_create_limiter(self._policy)
+        if limiter is None:
             return
 
-        request.state.rate_limit_metadata = metadata
+        dependency = PackageRateLimiter(
+            limiter=limiter,
+            identifier=_resolve_rate_limit_identity,
+            callback=lambda req, resp: _on_rate_limit_exceeded(req, resp, self._policy),
+            blocking=False,
+        )
 
-    return _check
+        try:
+            await dependency(request, response)
+        except RateLimitError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "rate_limit.unavailable",
+                error=str(exc),
+                path=request.url.path,
+                limit=self._policy.limit,
+                window_seconds=self._policy.window_seconds,
+            )
+
+
+def rate_limit(tier: RateLimitTier) -> _AppRateLimiter:
+    """Bind a named tier to a route or router dependency.
+
+    Example:
+        @router.post(
+            "/transactions/recompute",
+            dependencies=[Depends(rate_limit(RateLimitTier.EXPENSIVE))],
+        )
+        async def recompute(...):
+            ...
+
+    Example:
+        auth_router = APIRouter(
+            prefix="/auth",
+            dependencies=[Depends(rate_limit(RateLimitTier.AUTH))],
+        )
+
+    Example:
+        app.include_router(
+            api_router,
+            prefix="/api/v1",
+            dependencies=[Depends(rate_limit(RateLimitTier.DEFAULT))],
+        )
+    """
+    policy = _policy_for_tier(tier)
+    if policy is None:
+        raise ValueError("RateLimitTier.EXEMPT should use @skip_limiter, not rate_limit(...)")
+    return _AppRateLimiter(policy)
+
+
+__all__ = [
+    "RateLimitTier",
+    "initialize_rate_limiting",
+    "rate_limit",
+    "skip_limiter",
+]

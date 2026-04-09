@@ -70,6 +70,22 @@ class ObservabilityConfig(BaseSettings):
     posthog_host: str = "https://app.posthog.com"
 
 
+class RateLimitConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="RATE_LIMIT_", extra="ignore")
+
+    default_limit: int = 100
+    default_window_seconds: int = 60
+
+    write_limit: int = 30
+    write_window_seconds: int = 60
+
+    expensive_limit: int = 10
+    expensive_window_seconds: int = 60
+
+    auth_limit: int = 5
+    auth_window_seconds: int = 60
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -87,11 +103,11 @@ class Settings(BaseSettings):
     plaid: PlaidConfig = PlaidConfig()
     anthropic: AnthropicConfig = AnthropicConfig()
     observability: ObservabilityConfig = ObservabilityConfig()
+    rate_limit: RateLimitConfig = RateLimitConfig()
 
     # App-level
     debug: bool = False
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:8080"]
-    rate_limit_default: int = 100  # requests per minute per user
     request_timeout: int = 30  # seconds
     request_max_body_size: int = 1_048_576  # 1MB
     shutdown_timeout: int = 15  # seconds
@@ -123,6 +139,7 @@ class Settings(BaseSettings):
             "plaid": PlaidConfig,
             "anthropic": AnthropicConfig,
             "observability": ObservabilityConfig,
+            "rate_limit": RateLimitConfig,
         }
 
         merged = dict(values)
@@ -166,6 +183,9 @@ class Settings(BaseSettings):
             raise ValueError("request_max_body_size must be greater than 0")
         if self.shutdown_timeout <= 0:
             raise ValueError("shutdown_timeout must be greater than 0")
+        for name, value in self.rate_limit.model_dump().items():
+            if value <= 0:
+                raise ValueError(f"rate_limit.{name} must be greater than 0")
         return self
 
     @field_validator("environment", mode="before")

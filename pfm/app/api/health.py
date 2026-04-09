@@ -10,6 +10,7 @@ import asyncio
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from fastapi_limiter.decorators import skip_limiter
 from sqlalchemy import text
 
 from app.auth.service import AuthService
@@ -35,12 +36,14 @@ def _mark_dependency_unhealthy(
 
 
 @router.get("/health")
+@skip_limiter
 async def liveness() -> dict:
     """Shallow liveness check. No dependency checks."""
     return {"status": "healthy"}
 
 
 @router.get("/health/ready")
+@skip_limiter
 async def readiness(request: Request) -> dict:
     """Deep readiness check. Verifies DB, Redis, auth configuration, and reports status."""
     if request.app.state.shutting_down:
