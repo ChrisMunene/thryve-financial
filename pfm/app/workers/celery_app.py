@@ -1,10 +1,21 @@
+import atexit
+
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import (
+    beat_embedded_init,
+    beat_init,
+    worker_process_init,
+    worker_process_shutdown,
+)
 from kombu import Exchange, Queue
 
 from app.config import get_settings
+from app.core.logging import configure_logging
+from app.core.telemetry import TelemetryProcessRole, bootstrap_worker_telemetry
 
 settings = get_settings()
+configure_logging(settings.environment, settings.observability.log_level)
 
 celery_app = Celery(
     "pfm",
@@ -56,3 +67,33 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=2, minute=0, day_of_week="sunday"),
     },
 }
+
+_telemetry_runtime = None
+
+
+def _shutdown_telemetry(*args, **kwargs) -> None:
+    global _telemetry_runtime
+    if _telemetry_runtime is not None:
+        _telemetry_runtime.shutdown()
+        _telemetry_runtime = None
+
+
+@worker_process_init.connect(weak=False)
+def _bootstrap_worker_telemetry(*args, **kwargs) -> None:
+    global _telemetry_runtime
+    _telemetry_runtime = bootstrap_worker_telemetry(TelemetryProcessRole.WORKER, settings)
+
+
+@beat_init.connect(weak=False)
+@beat_embedded_init.connect(weak=False)
+def _bootstrap_beat_telemetry(*args, **kwargs) -> None:
+    global _telemetry_runtime
+    _telemetry_runtime = bootstrap_worker_telemetry(TelemetryProcessRole.BEAT, settings)
+
+
+@worker_process_shutdown.connect(weak=False)
+def _shutdown_worker_telemetry(*args, **kwargs) -> None:
+    _shutdown_telemetry()
+
+
+atexit.register(_shutdown_telemetry)

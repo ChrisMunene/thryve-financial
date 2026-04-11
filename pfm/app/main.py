@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from importlib.metadata import version
+
 import structlog
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +11,7 @@ from app.config import get_settings
 from app.core.logging import configure_logging
 from app.core.rate_limit import RateLimitTier, initialize_rate_limiting, rate_limit
 from app.core.security import SecurityHeadersMiddleware
-from app.core.telemetry import configure_telemetry, instrument_app, shutdown_telemetry
+from app.core.telemetry import bootstrap_api_telemetry
 from app.middleware.correlation import (
     CorrelationIdMiddleware,
     generate_correlation_id,
@@ -21,8 +22,6 @@ from app.middleware.operational import BodySizeLimitMiddleware, RequestTimeoutMi
 from app.middleware.user_context import UserContextMiddleware
 
 logger = structlog.get_logger()
-
-
 
 async def _cleanup_resources() -> None:
     """Dispose of async resources during shutdown."""
@@ -40,21 +39,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings = get_settings()
 
     app.state.shutting_down = False
+    app.state.telemetry_runtime = None
 
     # 1. Initialize structured logging
     configure_logging(settings.environment, settings.observability.log_level)
 
     # 2. Initialize OpenTelemetry
-    configure_telemetry(
-        service_name="pfm",
-        environment=settings.environment.value,
-        exporter_type=settings.observability.exporter,
-        otlp_endpoint=settings.observability.endpoint,
-    )
-    instrument_app(app)
+    app.state.telemetry_runtime = bootstrap_api_telemetry(app, settings)
 
     # 3. Initialize Redis
     from app.db.redis import redis_client
+
     await redis_client.initialize()
     await initialize_rate_limiting()
 
@@ -73,11 +68,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     try:
         await asyncio.wait_for(_cleanup_resources(), timeout=settings.shutdown_timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("app.shutdown_timeout", timeout_seconds=settings.shutdown_timeout)
 
     # Flush OTEL after async resources have been drained.
-    shutdown_telemetry()
+    telemetry_runtime = getattr(app.state, "telemetry_runtime", None)
+    if telemetry_runtime is not None:
+        telemetry_runtime.shutdown()
 
     logger.info("app.shutdown_complete")
 

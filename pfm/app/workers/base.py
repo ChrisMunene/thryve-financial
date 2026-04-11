@@ -6,9 +6,10 @@ All app tasks should inherit from BaseTask.
 
 import structlog
 from celery import Task
+from opentelemetry.propagate import inject
 
 from app.core.context import clear_correlation_id, set_correlation_id
-from app.workers.celery_app import celery_app
+from app.core.telemetry import get_metrics
 
 logger = structlog.get_logger()
 
@@ -27,6 +28,8 @@ class BaseTask(Task):
         correlation_id = self.request.get("correlation_id")
         if correlation_id:
             set_correlation_id(correlation_id)
+
+        get_metrics().adjust_in_flight_tasks(task_name=self.name, delta=1)
 
         logger.info(
             "task.started",
@@ -57,6 +60,7 @@ class BaseTask(Task):
         )
 
     def after_return(self, status, retval, task_id, args, kwargs, einfo):
+        get_metrics().adjust_in_flight_tasks(task_name=self.name, delta=-1)
         clear_correlation_id()
 
 
@@ -66,4 +70,6 @@ def dispatch_task(task, *args, **kwargs):
 
     correlation_id = get_correlation_id()
     headers = {"correlation_id": correlation_id} if correlation_id else {}
+    inject(headers)
+    get_metrics().record_task_dispatch(task_name=getattr(task, "name", "unknown"))
     return task.apply_async(args=args, kwargs=kwargs, headers=headers)

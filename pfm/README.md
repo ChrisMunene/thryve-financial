@@ -94,6 +94,13 @@ This is an AI-first product. The roadmap includes streaming LLM responses, conve
 - **Postgres** — all app data (users, transactions, corrections, merchant rules, seed lookup table)
 - **Redis** — Celery broker, merchant lookup cache, LLM result cache, user override cache
 
+### Observability
+
+- FastAPI, SQLAlchemy, Redis, and HTTPX are instrumented through a shared telemetry runtime in `app/core/telemetry/`
+- Celery worker and beat processes bootstrap the same runtime shape with role-specific OTEL resources (`pfm-worker`, `pfm-beat`)
+- Structured logs stay on stdout/stderr and include `correlation_id`, `trace_id`, and `span_id` when a span is active
+- Staging and production are collector-first: traces and metrics export to an OpenTelemetry Collector via OTLP
+
 ### Categorization Engine
 
 Two-layer system:
@@ -297,7 +304,22 @@ See `.env.example` for all required variables. Key ones:
 - `DATABASE_URL` — Postgres connection string (asyncpg)
 - `REDIS_URL` — Redis connection string
 - `ANTHROPIC_API_KEY` — For LLM categorization layer
-- `SUPABASE_JWT_SECRET` — For auth middleware
+- `AUTH_SUPABASE_JWT_SECRET` — For auth middleware
+- `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` — `console` in development, `otlp` in staging/production
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — Collector endpoint for traces and metrics in staging/production
+- `OTEL_LOGS_EXPORTER` — Must remain `none` in this refactor; logs stay on stdout/stderr
+
+### Production observability
+
+Production and staging should point only at an OpenTelemetry Collector, not directly at a vendor backend:
+
+```bash
+OTEL_TRACES_EXPORTER=otlp
+OTEL_METRICS_EXPORTER=otlp
+OTEL_LOGS_EXPORTER=none
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+OTEL_PYTHON_FASTAPI_EXCLUDED_URLS=/api/v1/health,/api/v1/health/ready,/docs,/openapi.json
+```
 
 ## Data Pipeline
 

@@ -10,6 +10,7 @@ import uuid
 from asgi_correlation_id import CorrelationIdMiddleware
 
 _VALID_REQUEST_ID = re.compile(r"^[a-zA-Z0-9\-]{1,128}$")
+__all__ = ["CorrelationIdMiddleware", "generate_correlation_id", "is_valid_request_id"]
 
 
 def generate_correlation_id() -> str:

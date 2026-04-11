@@ -9,7 +9,7 @@ from app.core.context import (
     set_correlation_id,
     set_current_user_id,
 )
-from app.core.logging import add_current_user_id, redact_sensitive_fields
+from app.core.logging import add_current_user_id, add_trace_context, redact_sensitive_fields
 
 
 class TestSensitiveRedaction:
@@ -62,7 +62,7 @@ class TestCorrelationId:
     def test_generate_creates_uuid(self):
         cid = generate_correlation_id()
         assert cid is not None
-        assert len(cid) == 36  # UUID format
+        assert len(cid) == 36
 
     def test_set_and_get(self):
         set_correlation_id("test-123")
@@ -86,3 +86,41 @@ class TestCurrentUserId:
         set_current_user_id("user-123")
         event = add_current_user_id(None, "", {"event": "test"})
         assert event["current_user_id"] == "user-123"
+
+
+class TestTraceContext:
+    def test_logging_processor_adds_trace_context(self, monkeypatch):
+        class _FakeSpanContext:
+            is_valid = True
+            trace_id = int("1234", 16)
+            span_id = int("abcd", 16)
+
+        class _FakeSpan:
+            @staticmethod
+            def get_span_context():
+                return _FakeSpanContext()
+
+        monkeypatch.setattr("app.core.logging.trace.get_current_span", lambda: _FakeSpan())
+
+        event = add_trace_context(None, "", {"event": "test"})
+
+        assert event["trace_id"] == "00000000000000000000000000001234"
+        assert event["span_id"] == "000000000000abcd"
+
+    def test_logging_processor_skips_invalid_span(self, monkeypatch):
+        class _FakeSpanContext:
+            is_valid = False
+            trace_id = 0
+            span_id = 0
+
+        class _FakeSpan:
+            @staticmethod
+            def get_span_context():
+                return _FakeSpanContext()
+
+        monkeypatch.setattr("app.core.logging.trace.get_current_span", lambda: _FakeSpan())
+
+        event = add_trace_context(None, "", {"event": "test"})
+
+        assert "trace_id" not in event
+        assert "span_id" not in event

@@ -17,6 +17,7 @@ import structlog
 
 from app.core.context import get_correlation_id
 from app.core.exceptions import ExternalServiceError
+from app.core.telemetry import get_metrics
 
 logger = structlog.get_logger()
 
@@ -76,6 +77,7 @@ class BaseClient:
             try:
                 response = await self._client.request(method, path, **kwargs)
                 duration = time.monotonic() - start
+                duration_ms = round(duration * 1000)
 
                 logger.info(
                     "http.outbound",
@@ -83,8 +85,14 @@ class BaseClient:
                     method=method,
                     path=path,
                     status=response.status_code,
-                    duration_ms=round(duration * 1000),
+                    duration_ms=duration_ms,
                     headers=_redact_headers(dict(kwargs.get("headers", {}))),
+                )
+                get_metrics().record_outbound_request(
+                    service=self._service_name,
+                    method=method,
+                    status_code=response.status_code,
+                    duration_ms=duration_ms,
                 )
 
                 # Retry on 5xx
@@ -132,7 +140,8 @@ class BaseClient:
                     continue
 
         raise ExternalServiceError(
-            f"{self._service_name} request failed after {self._max_retries + 1} attempts: {last_exception}"
+            f"{self._service_name} request failed after "
+            f"{self._max_retries + 1} attempts: {last_exception}"
         )
 
     async def get(self, path: str, **kwargs) -> httpx.Response:
