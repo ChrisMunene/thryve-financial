@@ -1,15 +1,17 @@
 """Tests for rate limiting policy and integration."""
 
 import hashlib
+from inspect import isawaitable
 
 from fastapi import APIRouter, Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
+from pyrate_limiter import AbstractBucket
 from starlette.requests import Request
 
-from app.core import rate_limit as rate_limit_module
 from app.config import Settings
-from app.middleware.error_handler import register_error_handlers
+from app.core import rate_limit as rate_limit_module
 from app.main import create_app
+from app.middleware.error_handler import register_error_handlers
 
 
 class _FakeLimiter:
@@ -22,6 +24,30 @@ class _FakeLimiter:
         if self._results:
             return self._results.pop(0)
         return True
+
+
+class _FakeBucket(AbstractBucket):
+    def put(self, item):
+        return True
+
+    def leak(self, current_timestamp=None):
+        return 0
+
+    def flush(self):
+        return None
+
+    def count(self):
+        return 0
+
+    def peek(self, index: int):
+        return None
+
+
+def _async_return(value):
+    async def _inner(*args, **kwargs):
+        return value
+
+    return _inner
 
 
 class TestRateLimitIdentity:
@@ -84,10 +110,22 @@ class TestNamedPolicies:
         )
         monkeypatch.setattr(rate_limit_module, "_get_rate_limit_policies", lambda: policies)
 
-        assert rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.DEFAULT)._policy == policies.default
-        assert rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE)._policy == policies.write
-        assert rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.EXPENSIVE)._policy == policies.expensive
-        assert rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.AUTH)._policy == policies.auth
+        assert (
+            rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.DEFAULT)._policy
+            == policies.default
+        )
+        assert (
+            rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE)._policy
+            == policies.write
+        )
+        assert (
+            rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.EXPENSIVE)._policy
+            == policies.expensive
+        )
+        assert (
+            rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.AUTH)._policy
+            == policies.auth
+        )
 
     def test_exempt_tier_requires_skip_limiter(self):
         try:
@@ -96,6 +134,26 @@ class TestNamedPolicies:
             assert "skip_limiter" in str(exc)
         else:
             raise AssertionError("Expected ValueError for exempt tier binding")
+
+    async def test_get_or_create_limiter_awaits_async_redis_bucket_init(self, monkeypatch):
+        policy = rate_limit_module.RateLimitPolicy(10, 60)
+        bucket = _FakeBucket()
+
+        rate_limit_module._LIMITER_INSTANCE_CACHE.clear()
+        rate_limit_module._LIMITER_INIT_LOCKS.clear()
+
+        monkeypatch.setattr(rate_limit_module.redis_client, "_redis", object())
+
+        def fake_redis_bucket_init(*args, **kwargs):
+            return _async_return(bucket)()
+
+        monkeypatch.setattr(rate_limit_module.RedisBucket, "init", fake_redis_bucket_init)
+        monkeypatch.setattr(rate_limit_module, "Limiter", lambda argument: {"bucket": argument})
+
+        limiter = await rate_limit_module._get_or_create_limiter(policy)
+
+        assert limiter == {"bucket": bucket}
+        assert not isawaitable(limiter)
 
 
 class TestRateLimiterDependency:
@@ -116,7 +174,10 @@ class TestRateLimiterDependency:
 
         router = APIRouter()
 
-        @router.get("/limited", dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE))])
+        @router.get(
+            "/limited",
+            dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE))],
+        )
         async def limited():
             return {"ok": True}
 
@@ -125,7 +186,7 @@ class TestRateLimiterDependency:
         monkeypatch.setattr(
             rate_limit_module,
             "_get_or_create_limiter",
-            lambda policy: fake_limiter,
+            _async_return(fake_limiter),
         )
 
         transport = ASGITransport(app=app)
@@ -143,11 +204,14 @@ class TestRateLimiterDependency:
         app = FastAPI()
         register_error_handlers(app)
 
-        @app.get("/limited", dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE))])
+        @app.get(
+            "/limited",
+            dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE))],
+        )
         async def limited():
             return {"ok": True}
 
-        monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", lambda policy: None)
+        monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", _async_return(None))
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -163,7 +227,7 @@ class TestRateLimiterDependency:
         monkeypatch.setattr(
             rate_limit_module,
             "_get_or_create_limiter",
-            lambda policy: fake_limiter,
+            _async_return(fake_limiter),
         )
 
         transport = ASGITransport(app=app)

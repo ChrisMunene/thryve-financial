@@ -10,9 +10,11 @@ Public route API:
 Everything else in this module is an internal implementation detail.
 """
 
+import asyncio
 import hashlib
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
+from inspect import isawaitable
 
 import structlog
 from fastapi import Request, Response
@@ -35,9 +37,10 @@ class RateLimitPolicy:
     window_seconds: int
 
 _LIMITER_INSTANCE_CACHE: dict[RateLimitPolicy, Limiter] = {}
+_LIMITER_INIT_LOCKS: dict[RateLimitPolicy, asyncio.Lock] = {}
 
 
-class RateLimitTier(str, Enum):
+class RateLimitTier(StrEnum):
     DEFAULT = "default"
     WRITE = "write"
     EXPENSIVE = "expensive"
@@ -129,7 +132,7 @@ async def _on_rate_limit_exceeded(request: Request, response: Response, policy: 
     )
 
 
-def _get_or_create_limiter(policy: RateLimitPolicy) -> Limiter | None:
+async def _get_or_create_limiter(policy: RateLimitPolicy) -> Limiter | None:
     if policy.limit <= 0 or policy.window_seconds <= 0:
         raise ValueError("Rate limit policy values must be greater than 0")
 
@@ -137,32 +140,41 @@ def _get_or_create_limiter(policy: RateLimitPolicy) -> Limiter | None:
     if cached is not None:
         return cached
 
-    try:
-        bucket = RedisBucket.init(
-            [Rate(policy.limit, policy.window_seconds)],
-            redis_client.redis,
-            bucket_key=f"pfm-rate-limit:{policy.limit}:{policy.window_seconds}",
-        )
-    except Exception as exc:
-        logger.warning(
-            "rate_limit.unavailable",
-            error=str(exc),
-            limit=policy.limit,
-            window_seconds=policy.window_seconds,
-        )
-        return None
+    lock = _LIMITER_INIT_LOCKS.setdefault(policy, asyncio.Lock())
+    async with lock:
+        cached = _LIMITER_INSTANCE_CACHE.get(policy)
+        if cached is not None:
+            return cached
 
-    limiter = Limiter(bucket)
-    _LIMITER_INSTANCE_CACHE[policy] = limiter
-    return limiter
+        try:
+            bucket = RedisBucket.init(
+                [Rate(policy.limit, policy.window_seconds)],
+                redis_client.redis,
+                bucket_key=f"pfm-rate-limit:{policy.limit}:{policy.window_seconds}",
+            )
+            if isawaitable(bucket):
+                bucket = await bucket
+        except Exception as exc:
+            logger.warning(
+                "rate_limit.unavailable",
+                error=str(exc),
+                limit=policy.limit,
+                window_seconds=policy.window_seconds,
+            )
+            return None
+
+        limiter = Limiter(bucket)
+        _LIMITER_INSTANCE_CACHE[policy] = limiter
+        return limiter
 
 
 async def initialize_rate_limiting() -> None:
     """Warm the process-local limiter instance cache once Redis is initialized."""
     _LIMITER_INSTANCE_CACHE.clear()
+    _LIMITER_INIT_LOCKS.clear()
     policies = _get_rate_limit_policies().__dict__.values()
     for policy in policies:
-        _get_or_create_limiter(policy)
+        await _get_or_create_limiter(policy)
 
 
 class _AppRateLimiter:
@@ -172,7 +184,7 @@ class _AppRateLimiter:
         self._policy = policy
 
     async def __call__(self, request: Request, response: Response) -> None:
-        limiter = _get_or_create_limiter(self._policy)
+        limiter = await _get_or_create_limiter(self._policy)
         if limiter is None:
             return
 
