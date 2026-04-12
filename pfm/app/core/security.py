@@ -1,28 +1,36 @@
-"""
-Security headers middleware.
+"""Security headers middleware."""
 
-Adds standard security headers to every response.
-HSTS only in production.
-"""
+from __future__ import annotations
 
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.requests import Request
-from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, is_production: bool = False) -> None:
-        super().__init__(app)
+
+class SecurityHeadersMiddleware:
+    """Add standard security headers to every HTTP response."""
+
+    def __init__(self, app: ASGIApp, is_production: bool = False) -> None:
+        self.app = app
         self._is_production = is_production
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        response = await call_next(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"x-content-type-options", b"nosniff"))
+                headers.append((b"x-frame-options", b"DENY"))
+                if self._is_production:
+                    headers.append(
+                        (
+                            b"strict-transport-security",
+                            b"max-age=31536000; includeSubDomains",
+                        )
+                    )
+                message["headers"] = headers
 
-        if self._is_production:
-            response.headers["Strict-Transport-Security"] = (
-                "max-age=31536000; includeSubDomains"
-            )
+            await send(message)
 
-        return response
+        await self.app(scope, receive, send_with_headers)

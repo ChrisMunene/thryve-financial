@@ -284,6 +284,7 @@ class Settings(BaseSettings):
     # App-level
     debug: bool = False
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:8080"]
+    public_base_url: str = ""
     request_timeout: int = 30  # seconds
     request_max_body_size: int = 1_048_576  # 1MB
     shutdown_timeout: int = 15  # seconds

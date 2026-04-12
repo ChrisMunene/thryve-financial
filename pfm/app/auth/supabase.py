@@ -6,13 +6,10 @@ JWKS-based verification is not implemented yet.
 """
 
 import jwt
-import structlog
 
-from app.auth.delegate import AuthDelegate, TokenPayload
+from app.auth.delegate import TokenPayload
 from app.config import get_settings
-from app.core.exceptions import AuthenticationError
-
-logger = structlog.get_logger()
+from app.core.exceptions import AuthenticationRequiredError
 
 
 class SupabaseAuthDelegate:
@@ -38,9 +35,11 @@ class SupabaseAuthDelegate:
                 },
             )
         except jwt.ExpiredSignatureError:
-            raise AuthenticationError("Token has expired")
+            raise AuthenticationRequiredError.token_expired()
         except jwt.InvalidTokenError as e:
-            raise AuthenticationError(f"Invalid token: {e}")
+            raise AuthenticationRequiredError.invalid_token(
+                jwt_error_type=type(e).__name__
+            )
 
         user_id = payload.get("sub")
         email = payload.get("email", "")
@@ -48,7 +47,7 @@ class SupabaseAuthDelegate:
         user_metadata = payload.get("user_metadata", {})
 
         if not user_id:
-            raise AuthenticationError("Token missing subject claim")
+            raise AuthenticationRequiredError.missing_subject_claim()
 
         return TokenPayload(
             user_id=user_id,
@@ -60,7 +59,7 @@ class SupabaseAuthDelegate:
     async def refresh_token(self, token: str) -> str:
         # Supabase handles refresh via its own client SDK on the Flutter side.
         # This is a server-side fallback if needed.
-        raise AuthenticationError("Token refresh should be handled client-side via Supabase SDK")
+        raise AuthenticationRequiredError.unsupported_refresh_path()
 
     def validate_configuration(self) -> None:
         if not self._jwt_secret:

@@ -22,8 +22,9 @@ class TestRequestTimeoutMiddleware:
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             response = await ac.get("/slow")
 
-        assert response.status_code == 504
-        assert response.json()["error"]["code"] == "REQUEST_TIMEOUT"
+        assert response.status_code == 503
+        assert response.json()["code"] == "request_deadline_exceeded"
+        assert response.json()["retryable"] is True
 
 
 class TestBodySizeLimitMiddleware:
@@ -40,7 +41,7 @@ class TestBodySizeLimitMiddleware:
             response = await ac.post("/echo", content=b"123456789")
 
         assert response.status_code == 413
-        assert response.json()["error"]["code"] == "REQUEST_TOO_LARGE"
+        assert response.json()["code"] == "request_too_large"
 
     async def test_allows_body_within_limit(self):
         app = FastAPI()

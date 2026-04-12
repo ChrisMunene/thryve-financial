@@ -12,11 +12,12 @@ from fastapi import Depends, Request
 from app.auth.delegate import AuthDelegate
 from app.auth.schemas import CurrentUser
 from app.auth.service import AuthService
-from app.core.exceptions import AuthenticationError, AuthorizationError
-from app.db.session import get_db as get_db  # noqa: PLC0414 — re-export for DI
-
+from app.core.exceptions import AuthenticationRequiredError, PermissionDeniedError
+from app.db.session import get_db as get_db
 
 # --- Auth ---
+
+__all__ = ["get_db"]
 
 
 _auth_delegate: AuthDelegate | None = None
@@ -44,15 +45,15 @@ async def get_current_user(
     """Extract Bearer token from Authorization header and authenticate.
 
     Returns a typed CurrentUser object.
-    Raises AuthenticationError if the token is missing or invalid.
+    Raises AuthenticationRequiredError if the token is missing or invalid.
     """
     auth_header = request.headers.get("authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
-        raise AuthenticationError("Missing or invalid Authorization header")
+        raise AuthenticationRequiredError.missing_or_invalid_authorization_header()
 
     token = auth_header[7:]  # Strip "Bearer "
     if not token:
-        raise AuthenticationError("Empty token")
+        raise AuthenticationRequiredError.empty_bearer_token()
 
     current_user = await auth_service.authenticate(token)
     request.state.current_user = current_user
@@ -74,9 +75,7 @@ def require_role(*required_roles: str) -> Callable:
         current_user: CurrentUser = Depends(get_current_user),
     ) -> CurrentUser:
         if not any(role in current_user.roles for role in required_roles):
-            raise AuthorizationError(
-                f"Requires one of roles: {', '.join(required_roles)}"
-            )
+            raise PermissionDeniedError.missing_role(*required_roles)
         return current_user
 
     return _check_role
@@ -94,7 +93,7 @@ def require_permission(permission: str) -> Callable:
     ) -> CurrentUser:
         # For now, permissions are treated as roles. Extend later.
         if permission not in current_user.roles:
-            raise AuthorizationError(f"Missing permission: {permission}")
+            raise PermissionDeniedError.missing_permission(permission)
         return current_user
 
     return _check_permission

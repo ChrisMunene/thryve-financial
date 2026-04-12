@@ -1,8 +1,8 @@
-"""Tests for security middleware: headers, CORS, correlation ID in response."""
+"""Tests for security middleware: headers, CORS, correlation ID in responses."""
 
 from httpx import ASGITransport, AsyncClient
 
-from app.core.exceptions import AuthenticationError
+from app.core.exceptions import AuthenticationRequiredError
 
 
 class TestSecurityHeaders:
@@ -45,20 +45,23 @@ class TestSecurityHeaders:
             "/api/v1/health",
             headers={"origin": "http://localhost:3000"},
         )
-        assert response.headers["access-control-expose-headers"] == "X-Request-ID"
+        assert response.headers["access-control-expose-headers"] == (
+            "X-Request-ID, Idempotent-Replayed"
+        )
 
 
 class TestCorrelationErrorResponses:
     async def test_handled_error_includes_x_request_id_header(self, app, client):
         @app.get("/handled-correlation-error")
         async def handled_error():
-            raise AuthenticationError("invalid token")
+            raise AuthenticationRequiredError.default()
 
         response = await client.get("/handled-correlation-error")
 
         assert response.status_code == 401
         assert "x-request-id" in response.headers
-        assert response.json()["error"]["request_id"] == response.headers["x-request-id"]
+        assert response.json()["request_id"] == response.headers["x-request-id"]
+        assert response.headers["www-authenticate"] == "Bearer"
 
     async def test_unhandled_error_includes_x_request_id_header(self, app, client):
         @app.get("/unhandled-correlation-error")
@@ -71,4 +74,19 @@ class TestCorrelationErrorResponses:
 
         assert response.status_code == 500
         assert "x-request-id" in response.headers
-        assert response.json()["error"]["request_id"] == response.headers["x-request-id"]
+        assert response.json()["request_id"] == response.headers["x-request-id"]
+
+    async def test_unhandled_error_keeps_cors_headers(self, app):
+        @app.get("/cors-unhandled-error")
+        async def cors_unhandled_error():
+            raise RuntimeError("boom")
+
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get(
+                "/cors-unhandled-error",
+                headers={"origin": "http://localhost:3000"},
+            )
+
+        assert response.status_code == 500
+        assert response.headers["access-control-allow-origin"] == "http://localhost:3000"

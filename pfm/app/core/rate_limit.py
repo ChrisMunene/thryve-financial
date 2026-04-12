@@ -23,7 +23,7 @@ from fastapi_limiter.depends import RateLimiter as PackageRateLimiter
 from pyrate_limiter import Limiter, Rate, RedisBucket
 
 from app.config import Settings, get_settings
-from app.core.exceptions import RateLimitError
+from app.core.exceptions import RateLimitedError
 from app.db.redis import redis_client
 
 logger = structlog.get_logger()
@@ -99,6 +99,7 @@ def _policy_for_tier(tier: RateLimitTier) -> RateLimitPolicy | None:
         return None
     raise ValueError(f"Unsupported rate limit tier: {tier}")
 
+
 async def _resolve_rate_limit_identity(request: Request) -> str:
     user_id = getattr(request.state, "user_id", None)
     if user_id:
@@ -117,19 +118,8 @@ async def _resolve_rate_limit_identity(request: Request) -> str:
     return f"ip:{request.client.host}" if request.client else "ip:unknown"
 
 
-def _rate_limit_headers(policy: RateLimitPolicy) -> dict[str, str]:
-    return {
-        "Retry-After": str(policy.window_seconds),
-        "X-RateLimit-Limit": str(policy.limit),
-    }
-
-
 async def _on_rate_limit_exceeded(request: Request, response: Response, policy: RateLimitPolicy):
-    raise RateLimitError(
-        message=f"Rate limit exceeded. Try again in {policy.window_seconds} seconds.",
-        headers=_rate_limit_headers(policy),
-        details=[str(policy.window_seconds)],
-    )
+    raise RateLimitedError.for_window(policy.window_seconds, limit=policy.limit)
 
 
 async def _get_or_create_limiter(policy: RateLimitPolicy) -> Limiter | None:
@@ -197,7 +187,7 @@ class _AppRateLimiter:
 
         try:
             await dependency(request, response)
-        except RateLimitError:
+        except RateLimitedError:
             raise
         except Exception as exc:
             logger.warning(

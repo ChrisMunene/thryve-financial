@@ -9,7 +9,8 @@ import structlog
 
 from app.config import get_settings
 from app.core.context import get_correlation_id
-from app.core.exceptions import ExternalServiceError
+from app.core.exceptions import DependencyUnavailableError
+from app.core.responses import ProblemUpstream
 
 logger = structlog.get_logger()
 
@@ -73,7 +74,11 @@ class AnthropicClient:
                 error=str(e),
                 duration_ms=round(duration * 1000),
             )
-            raise ExternalServiceError(f"Anthropic API error: {e}") from e
+            raise DependencyUnavailableError.for_service(
+                "anthropic",
+                upstream=ProblemUpstream(provider="anthropic"),
+                extra_log_context={"sdk_error_type": type(e).__name__},
+            ) from e
 
     async def close(self) -> None:
         if self._client:

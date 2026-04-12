@@ -16,6 +16,7 @@ class MetricKind(StrEnum):
 
 
 class MetricName(StrEnum):
+    API_ERRORS = "http.server.errors"
     OUTBOUND_REQUESTS = "http.client.requests"
     OUTBOUND_REQUEST_DURATION = "http.client.duration"
     TASKS_DISPATCHED = "worker.tasks.dispatched"
@@ -32,6 +33,12 @@ class MetricDefinition:
 
 
 METRIC_DEFINITIONS: dict[MetricName, MetricDefinition] = {
+    MetricName.API_ERRORS: MetricDefinition(
+        name=MetricName.API_ERRORS,
+        kind=MetricKind.COUNTER,
+        description="Count of API errors emitted by the service.",
+        allowed_attributes=frozenset({"code", "status_class", "retryable"}),
+    ),
     MetricName.OUTBOUND_REQUESTS: MetricDefinition(
         name=MetricName.OUTBOUND_REQUESTS,
         kind=MetricKind.COUNTER,
@@ -132,6 +139,22 @@ class AppMetrics:
             MetricName.OUTBOUND_REQUEST_DURATION,
             value=duration_ms,
             attributes=attributes,
+        )
+
+    def record_api_error(
+        self,
+        *,
+        code: str,
+        status_code: int,
+        retryable: bool,
+    ) -> None:
+        self.counter(
+            MetricName.API_ERRORS,
+            attributes={
+                "code": code,
+                "status_class": f"{status_code // 100}xx",
+                "retryable": str(retryable).lower(),
+            },
         )
 
     def record_task_dispatch(self, *, task_name: str) -> None:

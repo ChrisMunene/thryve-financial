@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import socket
 from collections.abc import Callable
@@ -105,8 +106,15 @@ class TelemetryRuntime:
                 error=str(exc),
             )
 
-        self.tracer_provider.shutdown()
-        self.meter_provider.shutdown()
+        try:
+            self.meter_provider.force_flush()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.warning(
+                "telemetry.metric_force_flush_failed",
+                process_role=self.process_role.value,
+                error=str(exc),
+            )
+
         reset_metrics_provider()
         self._is_shutdown = True
         if _ACTIVE_RUNTIME is self:
@@ -114,7 +122,10 @@ class TelemetryRuntime:
 
 
 _ACTIVE_RUNTIME: TelemetryRuntime | None = None
-_GLOBAL_PROVIDERS_BOUND = False
+_PROCESS_TRACER_PROVIDER: TracerProvider | None = None
+_PROCESS_METER_PROVIDER: MeterProvider | None = None
+_PROCESS_ROLE: TelemetryProcessRole | None = None
+_PROCESS_SHUTDOWN_REGISTERED = False
 
 
 def bootstrap_api_telemetry(app: FastAPI, settings: Settings) -> TelemetryRuntime:
@@ -138,7 +149,7 @@ def _bootstrap_runtime(
     process_role: TelemetryProcessRole,
     settings: Settings,
 ) -> TelemetryRuntime:
-    global _ACTIVE_RUNTIME, _GLOBAL_PROVIDERS_BOUND
+    global _ACTIVE_RUNTIME, _PROCESS_METER_PROVIDER, _PROCESS_ROLE, _PROCESS_TRACER_PROVIDER
 
     if _ACTIVE_RUNTIME is not None and not _ACTIVE_RUNTIME._is_shutdown:
         if _ACTIVE_RUNTIME.process_role != process_role:
@@ -148,14 +159,25 @@ def _bootstrap_runtime(
             )
         return _ACTIVE_RUNTIME
 
-    resource = _build_resource(settings, process_role)
-    tracer_provider = _build_tracer_provider(settings, resource)
-    meter_provider = _build_meter_provider(settings, resource)
-
-    if not _GLOBAL_PROVIDERS_BOUND:
+    if _PROCESS_TRACER_PROVIDER is None or _PROCESS_METER_PROVIDER is None:
+        resource = _build_resource(settings, process_role)
+        tracer_provider = _build_tracer_provider(settings, resource)
+        meter_provider = _build_meter_provider(settings, resource)
         trace.set_tracer_provider(tracer_provider)
         metrics.set_meter_provider(meter_provider)
-        _GLOBAL_PROVIDERS_BOUND = True
+        _PROCESS_TRACER_PROVIDER = tracer_provider
+        _PROCESS_METER_PROVIDER = meter_provider
+        _PROCESS_ROLE = process_role
+        _register_process_shutdown()
+    else:
+        if _PROCESS_ROLE != process_role:
+            raise RuntimeError(
+                "Telemetry providers are already initialized for this process as "
+                f"{_PROCESS_ROLE.value}. Start a new process to bootstrap "
+                f"{process_role.value} telemetry."
+            )
+        tracer_provider = _PROCESS_TRACER_PROVIDER
+        meter_provider = _PROCESS_METER_PROVIDER
 
     configure_metrics_provider(meter_provider)
 
@@ -329,3 +351,47 @@ def _load_celery_instrumentor() -> Any | None:
         return None
 
     return module.CeleryInstrumentor()
+
+
+def _register_process_shutdown() -> None:
+    global _PROCESS_SHUTDOWN_REGISTERED
+
+    if _PROCESS_SHUTDOWN_REGISTERED:
+        return
+
+    atexit.register(_shutdown_process_providers)
+    _PROCESS_SHUTDOWN_REGISTERED = True
+
+
+def _shutdown_process_providers() -> None:
+    global _PROCESS_METER_PROVIDER, _PROCESS_ROLE, _PROCESS_TRACER_PROVIDER
+
+    tracer_provider = _PROCESS_TRACER_PROVIDER
+    meter_provider = _PROCESS_METER_PROVIDER
+
+    if tracer_provider is None or meter_provider is None:
+        return
+
+    try:
+        tracer_provider.force_flush()
+    except Exception:  # pragma: no cover - interpreter shutdown cleanup
+        pass
+
+    try:
+        meter_provider.force_flush()
+    except Exception:  # pragma: no cover - interpreter shutdown cleanup
+        pass
+
+    try:
+        tracer_provider.shutdown()
+    except Exception:  # pragma: no cover - interpreter shutdown cleanup
+        pass
+
+    try:
+        meter_provider.shutdown()
+    except Exception:  # pragma: no cover - interpreter shutdown cleanup
+        pass
+
+    _PROCESS_TRACER_PROVIDER = None
+    _PROCESS_METER_PROVIDER = None
+    _PROCESS_ROLE = None

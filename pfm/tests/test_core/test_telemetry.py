@@ -57,11 +57,15 @@ class _FakeMeterProvider:
     def __init__(self, resource, metric_readers):
         self.resource = resource
         self.metric_readers = metric_readers
+        self.force_flush_calls = 0
         self.shutdown_calls = 0
         self.meter = _FakeMeter()
 
     def get_meter(self, name):
         return self.meter
+
+    def force_flush(self):
+        self.force_flush_calls += 1
 
     def shutdown(self):
         self.shutdown_calls += 1
@@ -131,7 +135,11 @@ def _patch_bootstrap_dependencies(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(telemetry_bootstrap, "_ACTIVE_RUNTIME", None)
-    monkeypatch.setattr(telemetry_bootstrap, "_GLOBAL_PROVIDERS_BOUND", False)
+    monkeypatch.setattr(telemetry_bootstrap, "_PROCESS_TRACER_PROVIDER", None)
+    monkeypatch.setattr(telemetry_bootstrap, "_PROCESS_METER_PROVIDER", None)
+    monkeypatch.setattr(telemetry_bootstrap, "_PROCESS_ROLE", None)
+    monkeypatch.setattr(telemetry_bootstrap, "_PROCESS_SHUTDOWN_REGISTERED", False)
+    monkeypatch.setattr(telemetry_bootstrap.atexit, "register", lambda callback: None)
     monkeypatch.setattr(telemetry_bootstrap, "TracerProvider", _FakeTracerProvider)
     monkeypatch.setattr(telemetry_bootstrap, "MeterProvider", _FakeMeterProvider)
     monkeypatch.setattr(telemetry_bootstrap, "BatchSpanProcessor", _FakeSpanProcessor)
@@ -164,12 +172,12 @@ def _patch_bootstrap_dependencies(monkeypatch):
     monkeypatch.setattr(
         telemetry_bootstrap.trace,
         "set_tracer_provider",
-        lambda provider: captured.setdefault("trace_provider", provider),
+        lambda provider: captured.setdefault("trace_provider_calls", []).append(provider),
     )
     monkeypatch.setattr(
         telemetry_bootstrap.metrics,
         "set_meter_provider",
-        lambda provider: captured.setdefault("meter_provider", provider),
+        lambda provider: captured.setdefault("meter_provider_calls", []).append(provider),
     )
     monkeypatch.setattr(telemetry_bootstrap, "get_engine", lambda: _FakeAsyncEngine())
 
@@ -194,15 +202,19 @@ def test_bootstrap_api_telemetry_uses_otlp_and_instruments_fastapi(monkeypatch):
     assert app.state.fastapi_instrumented["excluded_urls"] == ",".join(
         settings.observability.excluded_urls
     )
-    assert captured["trace_provider"].resource.attributes["service.name"] == "pfm-api"
-    metric_reader = captured["meter_provider"].metric_readers[0]
+    trace_provider = captured["trace_provider_calls"][0]
+    meter_provider = captured["meter_provider_calls"][0]
+    assert trace_provider.resource.attributes["service.name"] == "pfm-api"
+    metric_reader = meter_provider.metric_readers[0]
     assert metric_reader.exporter.endpoint == "http://collector:4317"
     assert "request_hook" in captured["httpx_instrument"]
 
     runtime.shutdown()
     assert app.state.fastapi_uninstrumented is True
-    assert captured["trace_provider"].shutdown_calls == 1
-    assert captured["meter_provider"].shutdown_calls == 1
+    assert trace_provider.force_flush_calls == 1
+    assert trace_provider.shutdown_calls == 0
+    assert meter_provider.force_flush_calls == 1
+    assert meter_provider.shutdown_calls == 0
 
 
 def test_bootstrap_worker_telemetry_is_idempotent_and_uses_worker_service_name(monkeypatch):
@@ -226,7 +238,8 @@ def test_bootstrap_worker_telemetry_is_idempotent_and_uses_worker_service_name(m
     )
 
     assert runtime_one is runtime_two
-    assert captured["trace_provider"].resource.attributes["service.name"] == "pfm-worker"
+    trace_provider = captured["trace_provider_calls"][0]
+    assert trace_provider.resource.attributes["service.name"] == "pfm-worker"
 
     runtime_one.shutdown()
     runtime_one.shutdown()
@@ -255,6 +268,36 @@ def test_bootstrap_api_telemetry_does_not_require_celery_instrumentation(monkeyp
     )
 
     runtime.shutdown()
+
+
+def test_bootstrap_api_telemetry_reuses_process_providers_after_shutdown(monkeypatch):
+    captured = _patch_bootstrap_dependencies(monkeypatch)
+    settings = Settings(
+        environment="development",
+        observability={
+            "traces_exporter": "otlp",
+            "metrics_exporter": "otlp",
+            "otlp_endpoint": "http://collector:4317",
+        },
+    )
+
+    first_app = FastAPI()
+    first_runtime = telemetry_bootstrap.bootstrap_api_telemetry(first_app, settings)
+    first_trace_provider = first_runtime.tracer_provider
+    first_meter_provider = first_runtime.meter_provider
+
+    first_runtime.shutdown()
+
+    second_app = FastAPI()
+    second_runtime = telemetry_bootstrap.bootstrap_api_telemetry(second_app, settings)
+
+    assert second_runtime is not first_runtime
+    assert second_runtime.tracer_provider is first_trace_provider
+    assert second_runtime.meter_provider is first_meter_provider
+    assert len(captured["trace_provider_calls"]) == 1
+    assert len(captured["meter_provider_calls"]) == 1
+
+    second_runtime.shutdown()
 
 
 def test_metrics_facade_validates_attributes_and_caches_instruments():

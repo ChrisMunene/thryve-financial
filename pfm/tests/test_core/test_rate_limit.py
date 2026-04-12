@@ -196,7 +196,8 @@ class TestRateLimiterDependency:
 
         assert first.status_code == 200
         assert second.status_code == 429
-        assert second.json()["error"]["code"] == "RATE_LIMIT_EXCEEDED"
+        assert second.json()["code"] == "rate_limited"
+        assert second.json()["retryable"] is True
         assert second.headers["retry-after"] == "60"
         assert second.headers["x-ratelimit-limit"] == "1"
 

@@ -1,17 +1,19 @@
 """
-Standardized response envelope.
+Response models for API success and problem responses.
 
-All API responses follow these shapes:
-- Success: {"data": ...}
-- Error: {"error": {"code": "...", "message": "...", "request_id": "..."}}
-- Paginated: {"data": [...], "pagination": {"cursor": "...", "has_more": true}}
+Success envelopes intentionally stay unchanged.
+Errors use RFC 9457 problem details with a few first-party extensions.
 """
 
-from typing import Any, Generic, TypeVar
+from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Any, Literal
 
-T = TypeVar("T")
+from pydantic import BaseModel, ConfigDict
+
+from app.core.user_actions import UserAction
+
+PROBLEM_JSON_MEDIA_TYPE = "application/problem+json"
 
 
 class PaginationMeta(BaseModel):
@@ -20,21 +22,56 @@ class PaginationMeta(BaseModel):
     total: int | None = None
 
 
-class Response(BaseModel, Generic[T]):
+class Response[T](BaseModel):
     """Standard success response envelope."""
 
     data: T
 
 
-class PaginatedResponse(BaseModel, Generic[T]):
+class PaginatedResponse[T](BaseModel):
     """Paginated list response envelope."""
 
     data: list[T]
     pagination: PaginationMeta
 
 
+class ProblemFieldError(BaseModel):
+    """A machine-readable field-level validation issue."""
+
+    source: Literal["body", "query", "path", "header", "cookie", "unknown"]
+    field: str | None = None
+    code: str
+    message: str
+
+
+class ProblemUpstream(BaseModel):
+    """Safe upstream-provider metadata surfaced to first-party clients."""
+
+    provider: str
+    provider_code: str | None = None
+    provider_request_id: str | None = None
+
+
+class ProblemResponse(BaseModel):
+    """RFC 9457 problem details response plus first-party extensions."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str
+    title: str
+    status: int
+    detail: str
+    instance: str
+    code: str
+    request_id: str | None = None
+    retryable: bool = False
+    errors: list[ProblemFieldError] | None = None
+    upstream: ProblemUpstream | None = None
+    user_action: UserAction | None = None
+
+
 class ErrorDetail(BaseModel):
-    """Error information in the envelope."""
+    """Legacy helper model retained for tests and non-HTTP callers."""
 
     code: str
     message: str
@@ -43,7 +80,7 @@ class ErrorDetail(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """Standard error response envelope."""
+    """Legacy helper wrapper retained for tests and non-HTTP callers."""
 
     error: ErrorDetail
 
@@ -72,9 +109,12 @@ def error_response(
     details: list[str] | None = None,
     request_id: str | None = None,
 ) -> ErrorResponse:
-    """Build the error envelope."""
+    """Legacy helper retained for unit tests and internal callers."""
     return ErrorResponse(
         error=ErrorDetail(
-            code=code, message=message, details=details, request_id=request_id,
-        ),
+            code=code,
+            message=message,
+            details=details,
+            request_id=request_id,
+        )
     )

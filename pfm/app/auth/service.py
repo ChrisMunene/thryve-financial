@@ -13,7 +13,7 @@ import structlog
 from app.auth.delegate import AuthDelegate, TokenPayload
 from app.auth.schemas import CurrentUser
 from app.core.context import set_current_user_id
-from app.core.exceptions import AuthenticationError
+from app.core.exceptions import AuthenticationRequiredError
 
 logger = structlog.get_logger()
 
@@ -35,18 +35,17 @@ class AuthService:
         """
         try:
             payload: TokenPayload = await self._delegate.verify_token(token)
-        except AuthenticationError:
-            logger.warning("authentication.failed", reason="delegate_rejected")
+        except AuthenticationRequiredError:
             raise
         except Exception as e:
-            logger.error("authentication.error", error=str(e))
-            raise AuthenticationError("Authentication failed") from e
+            raise AuthenticationRequiredError.delegate_error(
+                delegate_error_type=type(e).__name__
+            ) from e
 
         try:
             user_uuid = uuid.UUID(payload.user_id)
         except (ValueError, AttributeError):
-            logger.warning("authentication.failed", reason="malformed_user_id")
-            raise AuthenticationError("Invalid user ID in token")
+            raise AuthenticationRequiredError.malformed_user_id()
 
         # Mirror the validated user ID into request-local context for logs/telemetry.
         set_current_user_id(str(user_uuid))

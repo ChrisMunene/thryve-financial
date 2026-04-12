@@ -12,9 +12,8 @@ from app.auth.schemas import CurrentUser
 from app.auth.service import AuthService
 from app.auth.supabase import SupabaseAuthDelegate
 from app.core.context import clear_current_user_id, get_current_user_id
-from app.core.exceptions import AuthenticationError, AuthorizationError
+from app.core.exceptions import AuthenticationRequiredError
 from app.dependencies import get_current_user
-
 
 # --- Mock Delegate ---
 
@@ -78,24 +77,27 @@ class TestSupabaseDelegate:
             "email": "user@test.com",
             "exp": 0,  # expired
         })
-        with pytest.raises(AuthenticationError, match="expired"):
+        with pytest.raises(AuthenticationRequiredError) as exc_info:
             await delegate.verify_token(token)
+        assert exc_info.value.extra_log_context["auth_reason"] == "token_expired"
 
     async def test_invalid_signature(self):
         delegate = SupabaseAuthDelegate()
         delegate._jwt_secret = self.CORRECT_TEST_SECRET
 
         token = self._make_token({"sub": "user-1"}, secret=self.WRONG_TEST_SECRET)
-        with pytest.raises(AuthenticationError, match="Invalid token"):
+        with pytest.raises(AuthenticationRequiredError) as exc_info:
             await delegate.verify_token(token)
+        assert exc_info.value.extra_log_context["auth_reason"] == "invalid_token"
 
     async def test_missing_subject(self):
         delegate = SupabaseAuthDelegate()
         delegate._jwt_secret = self.VALID_TEST_SECRET
 
         token = self._make_token({"email": "no-sub@test.com"})
-        with pytest.raises(AuthenticationError, match="missing subject"):
+        with pytest.raises(AuthenticationRequiredError) as exc_info:
             await delegate.verify_token(token)
+        assert exc_info.value.extra_log_context["auth_reason"] == "missing_subject_claim"
 
     def test_validate_configuration_requires_secret(self):
         delegate = SupabaseAuthDelegate()
@@ -125,12 +127,12 @@ class TestAuthService:
     async def test_authenticate_propagates_auth_error(self):
         class FailingDelegate:
             async def verify_token(self, token: str) -> TokenPayload:
-                raise AuthenticationError("Token expired")
+                raise AuthenticationRequiredError.default()
             async def refresh_token(self, token: str) -> str:
                 return ""
 
         service = AuthService(delegate=FailingDelegate())
-        with pytest.raises(AuthenticationError, match="Token expired"):
+        with pytest.raises(AuthenticationRequiredError):
             await service.authenticate("bad-token")
 
     async def test_authenticate_wraps_unexpected_error(self):
@@ -141,16 +143,18 @@ class TestAuthService:
                 return ""
 
         service = AuthService(delegate=BrokenDelegate())
-        with pytest.raises(AuthenticationError, match="Authentication failed"):
+        with pytest.raises(AuthenticationRequiredError) as exc_info:
             await service.authenticate("any-token")
+        assert exc_info.value.extra_log_context["auth_reason"] == "delegate_error"
 
     async def test_authenticate_does_not_set_context_for_invalid_user_id(self):
         clear_current_user_id()
         delegate = MockAuthDelegate(user_id="not-a-uuid")
         service = AuthService(delegate=delegate)
 
-        with pytest.raises(AuthenticationError, match="Invalid user ID"):
+        with pytest.raises(AuthenticationRequiredError) as exc_info:
             await service.authenticate("any-token")
+        assert exc_info.value.extra_log_context["auth_reason"] == "malformed_user_id"
 
         assert get_current_user_id() is None
 
