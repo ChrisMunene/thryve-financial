@@ -161,6 +161,7 @@ class TestProblemHierarchy:
 class TestResponseModels:
     def test_success_response(self):
         result = success_response({"id": "123", "name": "Chris"})
+        assert result.ok is True
         assert result.data["id"] == "123"
 
     def test_paginated_response(self):
@@ -170,6 +171,7 @@ class TestResponseModels:
             has_more=True,
             total=42,
         )
+        assert result.ok is True
         assert len(result.data) == 2
         assert result.pagination.cursor == "abc123"
         assert result.pagination.has_more is True
@@ -201,6 +203,7 @@ class TestResponseModels:
             user_action=UserAction.REAUTHENTICATE_BANK,
         )
 
+        assert result.ok is False
         assert result.request_id == "req-123"
         assert result.errors[0].source == "query"
         assert result.upstream.provider_request_id == "plaid-123"

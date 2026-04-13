@@ -4,7 +4,6 @@ Problem-details helpers and docs.
 
 from __future__ import annotations
 
-from typing import Any
 from urllib.parse import urljoin
 
 from fastapi import Request
@@ -15,6 +14,7 @@ from app.core.context import get_correlation_id
 from app.core.exceptions import PROBLEM_DEFINITIONS, ProblemException
 from app.core.idempotency import IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_STATUS_HEADER
 from app.core.responses import PROBLEM_JSON_MEDIA_TYPE, ProblemResponse
+from app.schemas import ProblemDefinitionResponse
 
 
 def _normalized_base_url(request: Request) -> str:
@@ -78,18 +78,21 @@ def problem_response(request: Request, exc: ProblemException) -> JSONResponse:
     )
 
 
-def problem_definition_payload(request: Request, type_slug: str) -> dict[str, Any] | None:
+def problem_definition_payload(
+    request: Request,
+    type_slug: str,
+) -> ProblemDefinitionResponse | None:
     definition = PROBLEM_DEFINITIONS.get(type_slug)
     if definition is None:
         return None
 
-    return {
-        "type": problem_type_url(request, definition.type_slug),
-        "title": definition.title,
-        "status": definition.status,
-        "code": definition.code,
-        "description": definition.description,
-        "default_detail": definition.default_detail,
-        "retryable": definition.retryable,
-        "user_action": definition.user_action,
-    }
+    return ProblemDefinitionResponse(
+        type=problem_type_url(request, definition.type_slug),
+        title=definition.title,
+        status=definition.status,
+        code=definition.code,
+        description=definition.description,
+        default_detail=definition.default_detail,
+        retryable=definition.retryable,
+        user_action=definition.user_action,
+    )

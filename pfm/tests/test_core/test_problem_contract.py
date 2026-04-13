@@ -51,6 +51,7 @@ async def test_404_normalizes_to_problem_details(client):
 
     assert response.status_code == 404
     assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["ok"] is False
     assert response.json()["code"] == "resource_not_found"
 
 
@@ -208,7 +209,8 @@ async def test_problem_docs_surface_default_user_action(client):
     response = await client.get("/problems/authentication-required")
 
     assert response.status_code == 200
-    assert response.json()["user_action"] == UserAction.REAUTHENTICATE
+    assert response.json()["ok"] is True
+    assert response.json()["data"]["user_action"] == UserAction.REAUTHENTICATE
 
 
 async def test_admin_route_can_be_authorized_with_override(app, client):

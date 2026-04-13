@@ -9,15 +9,17 @@ import asyncio
 
 import structlog
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 from fastapi_limiter.decorators import skip_limiter
 from sqlalchemy import text
 
 from app.auth.service import AuthService
+from app.core.exceptions import DependencyUnavailableError
 from app.core.idempotency import IdempotencyRoute
+from app.core.responses import ProblemFieldError, Response, success_response
 from app.db.redis import redis_client
 from app.db.session import get_async_session_factory
 from app.dependencies import _get_auth_delegate
+from app.schemas import LivenessResponseData, ReadinessResponseData
 
 logger = structlog.get_logger()
 router = APIRouter(tags=["health"], route_class=IdempotencyRoute)
@@ -36,19 +38,45 @@ def _mark_dependency_unhealthy(
     dependencies[name] = "error"
 
 
-@router.get("/health")
+def _readiness_problem(
+    *,
+    detail: str,
+    dependency_names: list[str] | None = None,
+) -> DependencyUnavailableError:
+    errors = None
+    if dependency_names:
+        errors = [
+            ProblemFieldError(
+                source="unknown",
+                field=name,
+                code="dependency_unavailable",
+                message="The dependency readiness check failed.",
+            )
+            for name in dependency_names
+        ]
+
+    return DependencyUnavailableError.default(
+        detail=detail,
+        errors=errors,
+        log_level="warning",
+    )
+
+
+@router.get("/health", response_model=Response[LivenessResponseData])
 @skip_limiter
-async def liveness() -> dict:
+async def liveness() -> Response[LivenessResponseData]:
     """Shallow liveness check. No dependency checks."""
-    return {"status": "healthy"}
+    return success_response(LivenessResponseData())
 
 
-@router.get("/health/ready")
+@router.get("/health/ready", response_model=Response[ReadinessResponseData])
 @skip_limiter
-async def readiness(request: Request) -> dict:
+async def readiness(request: Request) -> Response[ReadinessResponseData]:
     """Deep readiness check. Verifies DB, Redis, auth configuration, and reports status."""
     if request.app.state.shutting_down:
-        return JSONResponse(status_code=503, content={"status": "shutting_down"})
+        raise _readiness_problem(
+            detail="The service is shutting down and is not ready to accept traffic.",
+        )
 
     dependencies = {}
     healthy = True
@@ -80,13 +108,14 @@ async def readiness(request: Request) -> dict:
         _mark_dependency_unhealthy(dependencies, "auth", e)
         healthy = False
 
-    status_code = 200 if healthy else 503
-    result = {
-        "status": "healthy" if healthy else "unhealthy",
-        "dependencies": dependencies,
-    }
-
     if not healthy:
-        return JSONResponse(status_code=status_code, content=result)
+        raise _readiness_problem(
+            detail="One or more readiness checks failed.",
+            dependency_names=[name for name, status in dependencies.items() if status != "ok"],
+        )
 
-    return result
+    return success_response(
+        ReadinessResponseData(
+            dependencies=dependencies,
+        )
+    )

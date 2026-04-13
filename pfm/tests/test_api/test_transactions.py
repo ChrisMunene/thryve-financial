@@ -72,10 +72,13 @@ async def test_import_transactions_returns_202_and_uses_workflow_span(app, clien
 
         assert response.status_code == 202
         assert response.json() == {
-            "task_id": "task-123",
-            "imported_count": 2,
-            "next_cursor": "cursor-2",
-            "has_more": False,
+            "ok": True,
+            "data": {
+                "task_id": "task-123",
+                "imported_count": 2,
+                "next_cursor": "cursor-2",
+                "has_more": False,
+            },
         }
         assert fake_plaid.calls == [
             {"access_token": "access-sandbox-123", "cursor": "cursor-1"}

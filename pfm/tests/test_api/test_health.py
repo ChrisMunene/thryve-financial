@@ -16,7 +16,7 @@ async def _healthy_session_factory():
 async def test_health_check(client):
     response = await client.get("/api/v1/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "healthy"}
+    assert response.json() == {"ok": True, "data": {"status": "healthy"}}
 
 
 async def test_readiness_returns_200_when_dependencies_ready(client, monkeypatch):
@@ -34,7 +34,8 @@ async def test_readiness_returns_200_when_dependencies_ready(client, monkeypatch
 
     response = await client.get("/api/v1/health/ready")
     assert response.status_code == 200
-    assert response.json()["dependencies"] == {
+    assert response.json()["ok"] is True
+    assert response.json()["data"]["dependencies"] == {
         "database": "ok",
         "redis": "ok",
         "auth": "ok",
@@ -56,7 +57,10 @@ async def test_readiness_returns_503_when_auth_not_ready(client, monkeypatch):
 
     response = await client.get("/api/v1/health/ready")
     assert response.status_code == 503
-    assert response.json()["dependencies"]["auth"] == "error"
+    body = response.json()
+    assert body["ok"] is False
+    assert body["code"] == "dependency_unavailable"
+    assert body["errors"][0]["field"] == "auth"
 
 
 async def test_readiness_returns_503_during_shutdown(app, client):
@@ -64,7 +68,10 @@ async def test_readiness_returns_503_during_shutdown(app, client):
 
     response = await client.get("/api/v1/health/ready")
     assert response.status_code == 503
-    assert response.json() == {"status": "shutting_down"}
+    body = response.json()
+    assert body["ok"] is False
+    assert body["code"] == "dependency_unavailable"
+    assert "shutting down" in body["detail"].lower()
 
     app.state.shutting_down = False
 

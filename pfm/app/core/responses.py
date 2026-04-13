@@ -7,7 +7,7 @@ Errors use RFC 9457 problem details with a few first-party extensions.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -25,13 +25,13 @@ class PaginationMeta(BaseModel):
 class Response[T](BaseModel):
     """Standard success response envelope."""
 
+    ok: Literal[True] = True
     data: T
 
 
-class PaginatedResponse[T](BaseModel):
+class PaginatedResponse[T](Response[list[T]]):
     """Paginated list response envelope."""
 
-    data: list[T]
     pagination: PaginationMeta
 
 
@@ -57,6 +57,7 @@ class ProblemResponse(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
+    ok: Literal[False] = False
     type: str
     title: str
     status: int
@@ -70,51 +71,19 @@ class ProblemResponse(BaseModel):
     user_action: UserAction | None = None
 
 
-class ErrorDetail(BaseModel):
-    """Legacy helper model retained for tests and non-HTTP callers."""
-
-    code: str
-    message: str
-    details: list[str] | None = None
-    request_id: str | None = None
-
-
-class ErrorResponse(BaseModel):
-    """Legacy helper wrapper retained for tests and non-HTTP callers."""
-
-    error: ErrorDetail
-
-
-def success_response(data: Any) -> Response:
+def success_response[T](data: T) -> Response[T]:
     """Wrap data in the success envelope."""
     return Response(data=data)
 
 
-def paginated_response(
-    data: list[Any],
+def paginated_response[T](
+    data: list[T],
     cursor: str | None = None,
     has_more: bool = False,
     total: int | None = None,
-) -> PaginatedResponse:
+) -> PaginatedResponse[T]:
     """Wrap list data in the paginated envelope."""
     return PaginatedResponse(
         data=data,
         pagination=PaginationMeta(cursor=cursor, has_more=has_more, total=total),
-    )
-
-
-def error_response(
-    code: str,
-    message: str,
-    details: list[str] | None = None,
-    request_id: str | None = None,
-) -> ErrorResponse:
-    """Legacy helper retained for unit tests and internal callers."""
-    return ErrorResponse(
-        error=ErrorDetail(
-            code=code,
-            message=message,
-            details=details,
-            request_id=request_id,
-        )
     )
