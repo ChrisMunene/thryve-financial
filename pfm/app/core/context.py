@@ -1,8 +1,8 @@
 """
 Request context via contextvars.
 
-Stores correlation ID per request, accessible anywhere in the async call chain.
-Used by: structlog processors, error handler, outbound HTTP clients, Celery tasks.
+Stores correlation ID and analytics identity per request, accessible anywhere in
+the async call chain.
 """
 
 import uuid
@@ -10,6 +10,7 @@ from contextvars import ContextVar
 
 from asgi_correlation_id import correlation_id as _http_correlation_id
 
+_current_anonymous_id: ContextVar[str | None] = ContextVar("current_anonymous_id", default=None)
 _current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
 
 
@@ -35,9 +36,21 @@ def get_current_user_id() -> str | None:
     return _current_user_id.get()
 
 
+def get_current_anonymous_id() -> str | None:
+    return _current_anonymous_id.get()
+
+
 def set_current_user_id(value: str) -> None:
     _current_user_id.set(value)
 
 
+def set_current_anonymous_id(value: str) -> None:
+    _current_anonymous_id.set(value)
+
+
 def clear_current_user_id() -> None:
     _current_user_id.set(None)
+
+
+def clear_current_anonymous_id() -> None:
+    _current_anonymous_id.set(None)

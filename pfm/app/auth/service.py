@@ -3,7 +3,8 @@ Auth service — what the application sees.
 
 Wraps the delegate with cross-cutting concerns:
 logging, error handling, user context setting.
-Analytics tracking will be wired in once the analytics service exists.
+Analytics hooks should be added by explicit login/signup flows once the
+application knows a user transition has happened.
 """
 
 import uuid
@@ -63,7 +64,8 @@ class AuthService:
             email=user.email,
         )
 
-        # TODO: analytics.track("user.authenticated", ...) once analytics service exists
+        # Analytics identify/track calls belong in explicit identity transition
+        # flows rather than every authenticated request.
 
         return user
 

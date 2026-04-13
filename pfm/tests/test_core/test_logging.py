@@ -2,11 +2,14 @@
 
 from app.core.context import (
     clear_correlation_id,
+    clear_current_anonymous_id,
     clear_current_user_id,
     generate_correlation_id,
     get_correlation_id,
+    get_current_anonymous_id,
     get_current_user_id,
     set_correlation_id,
+    set_current_anonymous_id,
     set_current_user_id,
 )
 from app.core.logging import add_current_user_id, add_trace_context, redact_sensitive_fields
@@ -86,6 +89,16 @@ class TestCurrentUserId:
         set_current_user_id("user-123")
         event = add_current_user_id(None, "", {"event": "test"})
         assert event["current_user_id"] == "user-123"
+
+
+class TestCurrentAnonymousId:
+    def test_set_and_get(self):
+        set_current_anonymous_id("anon-123")
+        assert get_current_anonymous_id() == "anon-123"
+
+    def test_get_returns_none_when_cleared(self):
+        clear_current_anonymous_id()
+        assert get_current_anonymous_id() is None
 
 
 class TestTraceContext:

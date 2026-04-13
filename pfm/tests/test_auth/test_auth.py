@@ -11,7 +11,11 @@ from app.auth.mock import MockAuthDelegate
 from app.auth.schemas import CurrentUser
 from app.auth.service import AuthService
 from app.auth.supabase import SupabaseAuthDelegate
-from app.core.context import clear_current_user_id, get_current_user_id
+from app.core.context import (
+    clear_current_user_id,
+    get_current_anonymous_id,
+    get_current_user_id,
+)
 from app.core.exceptions import AuthenticationRequiredError
 from app.dependencies import get_current_user
 
@@ -199,6 +203,28 @@ class TestAuthDependencyContext:
         assert first.status_code == 200
         assert second.status_code == 200
         assert second.json() == {"current_user_id": None}
+
+    async def test_anonymous_context_is_hydrated_and_cleared_between_requests(self, app, client):
+        @app.get("/anonymous-context")
+        async def anonymous_context():
+            return {"anonymous_id": get_current_anonymous_id()}
+
+        first = await client.get(
+            "/anonymous-context",
+            headers={"X-Anonymous-ID": "anon-123"},
+        )
+        second = await client.get("/anonymous-context")
+        invalid = await client.get(
+            "/anonymous-context",
+            headers={"X-Anonymous-ID": "not valid"},
+        )
+
+        assert first.status_code == 200
+        assert first.json() == {"anonymous_id": "anon-123"}
+        assert second.status_code == 200
+        assert second.json() == {"anonymous_id": None}
+        assert invalid.status_code == 200
+        assert invalid.json() == {"anonymous_id": None}
 
 
 # --- CurrentUser ---

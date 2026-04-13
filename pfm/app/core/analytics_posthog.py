@@ -4,9 +4,12 @@ PostHog analytics delegate.
 Sends events to PostHog API. Used in staging/production.
 """
 
-import asyncio
+from collections.abc import Mapping
+from typing import Any
 
 import structlog
+
+from app.core.analytics import AnalyticsIdentity
 
 logger = structlog.get_logger()
 
@@ -22,24 +25,35 @@ class PostHogAnalyticsDelegate:
             logger.warning("posthog package not installed, PostHog delegate disabled")
             self._client = None
 
-    async def track(self, event: str, properties: dict, user_id: str | None = None) -> None:
-        if not self._client:
+    def track(
+        self,
+        event: str,
+        properties: Mapping[str, Any],
+        identity: AnalyticsIdentity,
+    ) -> None:
+        if not self._client or identity.distinct_id is None:
             return
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: self._client.capture(
-                distinct_id=user_id or "anonymous",
-                event=event,
-                properties=properties,
-            ),
+        self._client.capture(
+            distinct_id=identity.distinct_id,
+            event=event,
+            properties=dict(properties),
         )
 
-    async def identify(self, user_id: str, traits: dict) -> None:
+    def identify(
+        self,
+        user_id: str,
+        traits: Mapping[str, Any],
+        anonymous_id: str | None = None,
+    ) -> None:
         if not self._client:
             return
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: self._client.identify(distinct_id=user_id, properties=traits),
-        )
+
+        if anonymous_id and anonymous_id != user_id:
+            self._client.alias(previous_id=anonymous_id, distinct_id=user_id)
+
+        if traits:
+            self._client.set(distinct_id=user_id, properties=dict(traits))
+
+    def close(self) -> None:
+        if self._client:
+            self._client.shutdown()

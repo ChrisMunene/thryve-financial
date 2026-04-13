@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 from app.config import get_settings
+from app.core.analytics import create_analytics_service
 from app.core.idempotency import IdempotencyMiddleware
 from app.core.logging import configure_logging
 from app.core.rate_limit import RateLimitTier, initialize_rate_limiting, rate_limit
@@ -60,6 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     app.state.shutting_down = False
     app.state.telemetry_runtime = None
+    app.state.analytics = create_analytics_service()
 
     configure_logging(settings.environment, settings.observability.log_level)
     app.state.telemetry_runtime = bootstrap_api_telemetry(app, settings)
@@ -80,6 +82,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await asyncio.wait_for(_cleanup_resources(), timeout=settings.shutdown_timeout)
     except TimeoutError:
         logger.warning("app.shutdown_timeout", timeout_seconds=settings.shutdown_timeout)
+
+    analytics = getattr(app.state, "analytics", None)
+    if analytics is not None:
+        analytics.close()
 
     telemetry_runtime = getattr(app.state, "telemetry_runtime", None)
     if telemetry_runtime is not None:
@@ -174,6 +180,9 @@ def create_app() -> ASGIAppWrapper:
         debug=settings.debug,
         lifespan=lifespan,
     )
+    app.state.shutting_down = False
+    app.state.telemetry_runtime = None
+    app.state.analytics = None
 
     app.add_middleware(RequestTimeoutMiddleware, timeout_seconds=settings.request_timeout)
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=settings.request_max_body_size)
@@ -208,7 +217,13 @@ def create_app() -> ASGIAppWrapper:
         allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-Idempotency-Key"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Anonymous-ID",
+            "X-Request-ID",
+            "X-Idempotency-Key",
+        ],
         expose_headers=["X-Request-ID", "Idempotent-Replayed"],
     )
     return ASGIAppWrapper(app, outer_app)

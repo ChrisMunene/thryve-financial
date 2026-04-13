@@ -12,8 +12,9 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.auth.mock import MockAuthDelegate
-from app.dependencies import _get_auth_delegate
+from app.core.analytics import AnalyticsService, ConsoleAnalyticsDelegate
 from app.db.redis import redis_client
+from app.dependencies import _get_auth_delegate
 from app.main import create_app
 
 
@@ -137,6 +138,7 @@ def fake_redis():
 def app(fake_redis):
     application = create_app()
     application.state.shutting_down = False
+    application.state.analytics = AnalyticsService(delegates=[ConsoleAnalyticsDelegate()])
     # Override auth to use mock delegate in tests
     application.dependency_overrides[_get_auth_delegate] = lambda: MockAuthDelegate()
     return application
