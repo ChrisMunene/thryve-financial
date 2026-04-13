@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 from fastapi import Body, Depends, Query
 from httpx import ASGITransport, AsyncClient
 
 from app.auth.mock import MockAuthDelegate
 from app.clients.base import BaseClient
-from app.core.idempotency import require_idempotency
 from app.core.responses import success_response
 from app.core.user_actions import UserAction
 from app.dependencies import _get_auth_delegate, get_current_user, require_role
@@ -72,7 +69,10 @@ async def test_malformed_json_returns_400_problem(app, client):
     response = await client.post(
         "/probe-json",
         content=b'{"bad": ',
-        headers={"content-type": "application/json"},
+        headers={
+            "content-type": "application/json",
+            "Idempotency-Key": "problem-json-key",
+        },
     )
 
     assert response.status_code == 400
@@ -87,7 +87,10 @@ async def test_unsupported_media_type_returns_415_problem(app, client):
     response = await client.post(
         "/probe-media-type",
         content="plain text body",
-        headers={"content-type": "text/plain"},
+        headers={
+            "content-type": "text/plain",
+            "Idempotency-Key": "problem-media-type-key",
+        },
     )
 
     assert response.status_code == 415
@@ -180,69 +183,6 @@ async def test_provider_translation_keeps_safe_upstream_metadata(app, client):
     assert body["user_action"] == UserAction.RETRY
 
 
-async def test_idempotency_replays_completed_response(app, client):
-    call_count = {"value": 0}
-
-    @app.post("/probe-idempotent", dependencies=[Depends(require_idempotency)])
-    async def probe_idempotent(payload: dict = Body(...)):
-        call_count["value"] += 1
-        return success_response({"count": call_count["value"], "payload": payload})
-
-    headers = {"idempotency-key": "key-123"}
-    first = await client.post("/probe-idempotent", json={"amount": 10}, headers=headers)
-    second = await client.post("/probe-idempotent", json={"amount": 10}, headers=headers)
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert first.json() == second.json()
-    assert second.headers["idempotent-replayed"] == "true"
-
-
-async def test_idempotency_in_progress_returns_409(app, client):
-    started = asyncio.Event()
-
-    @app.post("/probe-idempotent-in-progress", dependencies=[Depends(require_idempotency)])
-    async def probe_idempotent_in_progress(payload: dict = Body(...)):
-        started.set()
-        await asyncio.sleep(1.5)
-        return success_response(payload)
-
-    headers = {"idempotency-key": "key-in-progress"}
-    first_request = asyncio.create_task(
-        client.post("/probe-idempotent-in-progress", json={"amount": 10}, headers=headers)
-    )
-    await started.wait()
-
-    second = await client.post(
-        "/probe-idempotent-in-progress",
-        json={"amount": 10},
-        headers=headers,
-    )
-    await first_request
-
-    assert second.status_code == 409
-    assert second.headers["retry-after"] == "1"
-    assert second.json()["code"] == "idempotency_request_in_progress"
-
-
-async def test_idempotency_payload_mismatch_returns_409(app, client):
-    @app.post("/probe-idempotent-mismatch", dependencies=[Depends(require_idempotency)])
-    async def probe_idempotent_mismatch(payload: dict = Body(...)):
-        return success_response(payload)
-
-    headers = {"idempotency-key": "key-mismatch"}
-    first = await client.post("/probe-idempotent-mismatch", json={"amount": 10}, headers=headers)
-    second = await client.post(
-        "/probe-idempotent-mismatch",
-        json={"amount": 20},
-        headers=headers,
-    )
-
-    assert first.status_code == 200
-    assert second.status_code == 409
-    assert second.json()["code"] == "idempotency_payload_mismatch"
-
-
 async def test_openapi_includes_problem_components(client):
     response = await client.get("/openapi.json")
     schema = response.json()
@@ -260,6 +200,7 @@ async def test_openapi_includes_problem_components(client):
         for option in user_action_schema["anyOf"]
     )
     assert "Problem400" in schema["components"]["responses"]
+    assert "Problem428" in schema["components"]["responses"]
     assert "Problem504" in schema["components"]["responses"]
 
 

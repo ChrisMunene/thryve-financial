@@ -5,6 +5,7 @@ from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import get_settings
+from app.models import idempotency  # noqa: F401
 from app.models.base import Base
 
 # Import all models here so autogenerate sees them

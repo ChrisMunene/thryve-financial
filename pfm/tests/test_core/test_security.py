@@ -46,7 +46,7 @@ class TestSecurityHeaders:
             headers={"origin": "http://localhost:3000"},
         )
         assert response.headers["access-control-expose-headers"] == (
-            "X-Request-ID, Idempotent-Replayed"
+            "X-Request-ID, Idempotency-Key, Idempotency-Status"
         )
 
 

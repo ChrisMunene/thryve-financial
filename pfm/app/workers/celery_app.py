@@ -24,6 +24,7 @@ celery_app = Celery(
     include=[
         "app.workers.categorization_tasks",
         "app.workers.aggregation_tasks",
+        "app.workers.idempotency_tasks",
         "app.workers.recap_tasks",
         "app.workers.training_tasks",
     ],
@@ -65,6 +66,10 @@ celery_app.conf.beat_schedule = {
     "weekly-training-export": {
         "task": "app.workers.training_tasks.export_training_data",
         "schedule": crontab(hour=2, minute=0, day_of_week="sunday"),
+    },
+    "daily-idempotency-cleanup": {
+        "task": "app.workers.idempotency_tasks.cleanup_expired_idempotency_requests",
+        "schedule": crontab(hour=3, minute=30),
     },
 }
 

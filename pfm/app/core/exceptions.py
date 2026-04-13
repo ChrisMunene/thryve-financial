@@ -356,6 +356,28 @@ class ConflictError(ProblemException):
         return cls.default(detail=message, extra_log_context=context)
 
 
+class IdempotencyKeyRequiredError(ProblemException):
+    status = 428
+    type_slug = "idempotency-key-required"
+    title = "Idempotency Key Required"
+    code = "idempotency_key_required"
+    description = "Mutation requests must include an Idempotency-Key header."
+    default_detail = "This mutation requires an Idempotency-Key header."
+    default_log_level = "warning"
+
+
+class IdempotencyScopeRequiredError(ProblemException):
+    status = 400
+    type_slug = "idempotency-scope-required"
+    title = "Idempotency Scope Required"
+    code = "idempotency_scope_required"
+    description = "Anonymous mutation requests require a validated anonymous ID."
+    default_detail = (
+        "Provide a valid X-Anonymous-ID header or authenticate before retrying."
+    )
+    default_log_level = "warning"
+
+
 class IdempotencyInProgressError(ProblemException):
     status = 409
     type_slug = "idempotency-request-in-progress"
@@ -371,6 +393,10 @@ class IdempotencyInProgressError(ProblemException):
     @classmethod
     def _default_headers(cls) -> dict[str, str]:
         return {"Retry-After": "1"}
+
+    @classmethod
+    def for_retry_after(cls, retry_after_seconds: int) -> IdempotencyInProgressError:
+        return cls._build(headers={"Retry-After": str(retry_after_seconds)})
 
 
 class IdempotencyPayloadMismatchError(ProblemException):
@@ -649,6 +675,8 @@ _PROBLEM_TYPES: tuple[type[ProblemException], ...] = (
     ResourceNotFoundError,
     MethodNotAllowedProblem,
     ConflictError,
+    IdempotencyKeyRequiredError,
+    IdempotencyScopeRequiredError,
     IdempotencyInProgressError,
     IdempotencyPayloadMismatchError,
     RequestTooLargeProblem,
@@ -683,6 +711,7 @@ def problem_for_status(
         413: RequestTooLargeProblem,
         415: UnsupportedMediaTypeError,
         422: RequestValidationProblem,
+        428: IdempotencyKeyRequiredError,
         429: RateLimitedError,
         500: InternalServerProblem,
         503: DependencyUnavailableError,
@@ -723,8 +752,10 @@ __all__ = [
     "ExternalServiceError",
     "GenericHTTPProblem",
     "IdempotencyConflictError",
+    "IdempotencyKeyRequiredError",
     "IdempotencyInProgressError",
     "IdempotencyPayloadMismatchError",
+    "IdempotencyScopeRequiredError",
     "InternalServerProblem",
     "MalformedRequestError",
     "MethodNotAllowedProblem",

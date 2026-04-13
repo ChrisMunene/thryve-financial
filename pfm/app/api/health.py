@@ -14,12 +14,13 @@ from fastapi_limiter.decorators import skip_limiter
 from sqlalchemy import text
 
 from app.auth.service import AuthService
+from app.core.idempotency import IdempotencyRoute
 from app.db.redis import redis_client
 from app.db.session import get_async_session_factory
 from app.dependencies import _get_auth_delegate
 
 logger = structlog.get_logger()
-router = APIRouter(tags=["health"])
+router = APIRouter(tags=["health"], route_class=IdempotencyRoute)
 
 
 def _mark_dependency_healthy(dependencies: dict[str, str], name: str) -> None:

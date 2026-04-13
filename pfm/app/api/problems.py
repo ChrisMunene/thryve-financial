@@ -4,9 +4,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.core.exceptions import ResourceNotFoundError
+from app.core.idempotency import IdempotencyRoute
 from app.core.problems import problem_definition_payload
 
-router = APIRouter(tags=["problems"])
+router = APIRouter(tags=["problems"], route_class=IdempotencyRoute)
 
 
 @router.get("/problems/{type_slug}")

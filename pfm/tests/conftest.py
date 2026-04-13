@@ -140,7 +140,8 @@ def app(fake_redis):
     application.state.shutting_down = False
     application.state.analytics = AnalyticsService(delegates=[ConsoleAnalyticsDelegate()])
     # Override auth to use mock delegate in tests
-    application.dependency_overrides[_get_auth_delegate] = lambda: MockAuthDelegate()
+    mock_delegate = MockAuthDelegate()
+    application.dependency_overrides[_get_auth_delegate] = lambda: mock_delegate
     return application
 
 

@@ -184,15 +184,3 @@ def register_error_handlers(app: FastAPI, debug: bool = False) -> None:
         problem = InternalServerProblem.default()
         _log_problem(request, problem, traceback_text=tb)
         return problem_response(request, problem)
-
-    try:
-        from app.core.idempotency import IdempotencyReplayResponse
-    except ImportError:
-        return
-
-    @app.exception_handler(IdempotencyReplayResponse)
-    async def handle_idempotency_replay(
-        request: Request,
-        exc: IdempotencyReplayResponse,
-    ) -> Response:
-        return exc.to_response()

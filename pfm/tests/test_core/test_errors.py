@@ -8,6 +8,7 @@ from app.core.exceptions import (
     DependencyUnavailableError,
     ExternalActionRequiredError,
     IdempotencyInProgressError,
+    IdempotencyKeyRequiredError,
     PermissionDeniedError,
     ProblemException,
     RateLimitedError,
@@ -99,6 +100,11 @@ class TestProblemHierarchy:
         exc = IdempotencyInProgressError.default()
         assert exc.status == 409
         assert exc.headers["Retry-After"] == "1"
+
+    def test_idempotency_key_required_problem_uses_428(self):
+        exc = IdempotencyKeyRequiredError.default()
+        assert exc.status == 428
+        assert exc.code == "idempotency_key_required"
 
     def test_problem_exception_rejects_invalid_user_action_for_problem_type(self):
         with pytest.raises(ValueError, match="Allowed values"):

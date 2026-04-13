@@ -1,288 +1,880 @@
-"""
-Idempotency primitives for mutation endpoints.
-
-Opt in with `Depends(require_idempotency)` and let `IdempotencyMiddleware`
-persist cacheable completed responses.
-"""
+"""Production idempotency primitives for mutation endpoints."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
-from dataclasses import dataclass
-from typing import Any
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from functools import lru_cache
+from typing import Any, Protocol
 
 import structlog
 from fastapi import Request
-from fastapi.responses import JSONResponse, Response
-from starlette.concurrency import iterate_in_threadpool
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.types import ASGIApp
+from fastapi.responses import Response
+from fastapi.routing import APIRoute
+from opentelemetry import trace
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.core.exceptions import (
     IdempotencyInProgressError,
+    IdempotencyKeyRequiredError,
     IdempotencyPayloadMismatchError,
+    IdempotencyScopeRequiredError,
 )
+from app.core.telemetry import get_metrics
 from app.db.redis import redis_client
+from app.db.session import get_async_session_factory
+from app.models.idempotency import IdempotencyRequest
 
 logger = structlog.get_logger()
 
-IDEMPOTENCY_PREFIX = "idempotency:"
-LOCK_PREFIX = "idempotency_lock:"
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_STATUS_HEADER = "Idempotency-Status"
+_CACHE_PREFIX = "idempotency:v2:"
 _MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_SKIP_IDEMPOTENCY_ATTR = "__skip_idempotency__"
+
+
+class IdempotencyRecordStatus(StrEnum):
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+
+
+class IdempotencyResponseStatus(StrEnum):
+    CREATED = "created"
+    REPLAYED = "replayed"
+    IN_PROGRESS = "in_progress"
+
+
+class IdempotencyScopeKind(StrEnum):
+    USER = "user"
+    ANONYMOUS = "anon"
+
+
+class IdempotencyStorageSource(StrEnum):
+    DATABASE = "db"
+    REDIS = "redis"
+    NONE = "none"
 
 
 @dataclass(frozen=True, slots=True)
-class IdempotencyRecord:
-    fingerprint: str
-    status_code: int
-    body: Any
-    is_json: bool
-    media_type: str | None
-    headers: dict[str, str]
+class IdempotencyScope:
+    kind: IdempotencyScopeKind
+    subject: str
+
+    @property
+    def value(self) -> str:
+        return f"{self.kind.value}:{self.subject}"
 
 
 @dataclass(frozen=True, slots=True)
-class IdempotencyContext:
-    key: str
-    fingerprint: str
-    ttl: int
-    lock_key: str
-    cache_key: str
-
-
-class IdempotencyReplayResponse(Exception):  # noqa: N818
-    """Internal signal used to short-circuit an endpoint with a replayed response."""
-
-    def __init__(self, record: IdempotencyRecord) -> None:
-        self.record = record
-        super().__init__("Idempotent response replay")
+class IdempotencyPolicy:
+    retention_seconds: int
+    processing_lease_seconds: int
+    cache_ttl_seconds: int
+    fingerprint_version: int = 1
 
     @classmethod
-    def from_json(cls, payload: str) -> IdempotencyReplayResponse:
-        raw = json.loads(payload)
+    def from_settings(cls, settings: Settings) -> IdempotencyPolicy:
         return cls(
-            IdempotencyRecord(
-                fingerprint=raw["fingerprint"],
-                status_code=raw["status_code"],
-                body=raw["body"],
-                is_json=raw["is_json"],
-                media_type=raw.get("media_type"),
-                headers=raw.get("headers", {}),
-            )
+            retention_seconds=settings.idempotency_retention_seconds,
+            processing_lease_seconds=settings.idempotency_processing_lease_seconds,
+            cache_ttl_seconds=settings.idempotency_cache_ttl_seconds,
         )
 
-    def to_response(self) -> Response:
-        headers = dict(self.record.headers)
-        headers["Idempotent-Replayed"] = "true"
+    def cache_ttl_for(self, expires_at: datetime, now: datetime) -> int:
+        remaining = int((expires_at - now).total_seconds())
+        return max(0, min(self.cache_ttl_seconds, remaining))
 
-        if self.record.is_json:
-            return JSONResponse(
-                status_code=self.record.status_code,
-                content=self.record.body,
-                headers=headers,
-                media_type=self.record.media_type or "application/json",
-            )
 
-        return Response(
-            content=self.record.body or b"",
-            status_code=self.record.status_code,
-            headers=headers,
-            media_type=self.record.media_type,
+@dataclass(frozen=True, slots=True)
+class IdempotencyResultRef:
+    serializer: str
+    version: int = 1
+    reference: dict[str, Any] = field(default_factory=dict)
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "serializer": self.serializer,
+            "version": self.version,
+            "reference": self.reference,
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any]) -> IdempotencyResultRef:
+        return cls(
+            serializer=str(payload["serializer"]),
+            version=int(payload.get("version", 1)),
+            reference=dict(payload.get("reference", {})),
         )
 
 
-def _canonical_json_body(body: bytes) -> str:
+class IdempotencyReplaySerializer(Protocol):
+    async def build_response(
+        self,
+        *,
+        request: Request,
+        session: AsyncSession,
+        result_ref: IdempotencyResultRef,
+        response_status_code: int,
+        result_type: str | None,
+    ) -> Response: ...
+
+
+class IdempotencySerializerRegistry:
+    def __init__(self) -> None:
+        self._serializers: dict[str, IdempotencyReplaySerializer] = {}
+
+    def register(
+        self,
+        serializer_name: str,
+        serializer: IdempotencyReplaySerializer,
+    ) -> None:
+        self._serializers[serializer_name] = serializer
+
+    def unregister(self, serializer_name: str) -> None:
+        self._serializers.pop(serializer_name, None)
+
+    def clear(self) -> None:
+        self._serializers.clear()
+
+    def serializer_for(self, serializer_name: str) -> IdempotencyReplaySerializer:
+        serializer = self._serializers.get(serializer_name)
+        if serializer is None:
+            raise LookupError(f"No idempotency serializer registered for {serializer_name!r}")
+        return serializer
+
+
+_serializer_registry = IdempotencySerializerRegistry()
+
+
+def register_idempotency_serializer(
+    serializer_name: str,
+    serializer: IdempotencyReplaySerializer,
+) -> None:
+    _serializer_registry.register(serializer_name, serializer)
+
+
+def unregister_idempotency_serializer(serializer_name: str) -> None:
+    _serializer_registry.unregister(serializer_name)
+
+
+def reset_idempotency_serializers() -> None:
+    _serializer_registry.clear()
+
+
+def skip_idempotency(endpoint: Callable[..., Any]) -> Callable[..., Any]:
+    """Opt a mutation route out of automatic key enforcement."""
+
+    setattr(endpoint, _SKIP_IDEMPOTENCY_ATTR, True)
+    return endpoint
+
+
+@dataclass(frozen=True, slots=True)
+class IdempotentOperationResult:
+    response: Response
+    result_ref: IdempotencyResultRef
+    persist: bool | None = None
+    result_type: str | None = None
+    error_code: str | None = None
+
+    def should_persist(self) -> bool:
+        if self.persist is not None:
+            return self.persist
+        return 200 <= self.response.status_code < 300
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedIdempotencyRequest:
+    key: str
+    key_hash: str
+    scope: IdempotencyScope
+    endpoint: str
+    fingerprint_hash: str
+    fingerprint_version: int
+
+    @property
+    def cache_key(self) -> str:
+        return _cache_key(self.scope.value, self.key)
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimedRequest:
+    record_id: uuid.UUID
+    lease_owner: str
+    lease_stolen: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayTarget:
+    record_id: uuid.UUID
+    storage_source: IdempotencyStorageSource
+
+
+@dataclass(frozen=True, slots=True)
+class _InProgressTarget:
+    retry_after_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedReplayRecord:
+    record_id: uuid.UUID
+    fingerprint_hash: str
+    result_type: str | None
+    result_ref: IdempotencyResultRef
+    response_status_code: int
+    expires_at: datetime
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _truncate_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _cache_key(scope_value: str, key: str) -> str:
+    raw = f"{scope_value}:{key}"
+    return f"{_CACHE_PREFIX}{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
+def _json_content_type(content_type: str) -> bool:
+    normalized = content_type.split(";", 1)[0].strip().lower()
+    return normalized == "application/json" or normalized.endswith("+json")
+
+
+def _canonical_json_text(body: bytes) -> str:
     parsed = json.loads(body)
-    return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        parsed,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
 
 
-async def _request_fingerprint(request: Request) -> str:
+def _normalize_path_params(request: Request) -> dict[str, str]:
+    return {
+        key: str(value)
+        for key, value in sorted(request.path_params.items(), key=lambda item: item[0])
+    }
+
+
+def _normalize_query_params(request: Request) -> list[tuple[str, str]]:
+    return sorted(
+        [(key, value) for key, value in request.query_params.multi_items()],
+        key=lambda item: (item[0], item[1]),
+    )
+
+
+async def _body_digest(request: Request) -> str:
     body = await request.body()
     content_type = request.headers.get("content-type", "")
-    if body and (
-        content_type.split(";", 1)[0].strip().lower() == "application/json"
-        or content_type.lower().endswith("+json")
-    ):
+    if body and _json_content_type(content_type):
         try:
-            canonical_body = _canonical_json_body(body)
-        except json.JSONDecodeError:
-            canonical_body = body.decode("utf-8", errors="replace")
+            normalized = _canonical_json_text(body).encode("utf-8")
+        except (json.JSONDecodeError, ValueError):
+            normalized = body
     else:
-        canonical_body = body.decode("utf-8", errors="replace")
+        normalized = body
+    return hashlib.sha256(normalized).hexdigest()
+
+
+async def _resolve_idempotency_request(
+    request: Request,
+    *,
+    policy: IdempotencyPolicy,
+    operation_name: str | None,
+) -> _ResolvedIdempotencyRequest:
+    key = request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    if not key:
+        raise IdempotencyKeyRequiredError.default()
+
+    user_id = getattr(request.state, "user_id", None)
+    if user_id:
+        scope = IdempotencyScope(IdempotencyScopeKind.USER, str(user_id))
+    else:
+        anonymous_id = getattr(request.state, "anonymous_id", None)
+        if not anonymous_id:
+            raise IdempotencyScopeRequiredError.default()
+        scope = IdempotencyScope(IdempotencyScopeKind.ANONYMOUS, str(anonymous_id))
 
     route = request.scope.get("route")
-    route_template = getattr(route, "path", request.url.path)
-    principal = getattr(request.state, "user_id", None) or "anonymous"
-    payload = "\n".join(
-        [principal, request.method.upper(), route_template, canonical_body]
+    route_path = getattr(route, "path", request.url.path)
+    route_name = getattr(route, "name", None) or "endpoint"
+    endpoint = operation_name or f"{request.method.upper()}:{route_path}:{route_name}"
+    content_type = request.headers.get("content-type", "")
+    fingerprint_payload = {
+        "scope": scope.value,
+        "method": request.method.upper(),
+        "endpoint": endpoint,
+        "path_params": _normalize_path_params(request),
+        "query_params": _normalize_query_params(request),
+        "content_type": content_type.split(";", 1)[0].strip().lower(),
+        "body_digest": await _body_digest(request),
+    }
+    fingerprint_hash = hashlib.sha256(
+        json.dumps(fingerprint_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return _ResolvedIdempotencyRequest(
+        key=key,
+        key_hash=_truncate_hash(key),
+        scope=scope,
+        endpoint=endpoint,
+        fingerprint_hash=fingerprint_hash,
+        fingerprint_version=policy.fingerprint_version,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _parse_record(raw: str) -> IdempotencyRecord:
-    payload = json.loads(raw)
-    return IdempotencyRecord(
-        fingerprint=payload["fingerprint"],
-        status_code=payload["status_code"],
-        body=payload["body"],
-        is_json=payload["is_json"],
-        media_type=payload.get("media_type"),
-        headers=payload.get("headers", {}),
-    )
+def _annotate_span(**attributes: str) -> None:
+    span = trace.get_current_span()
+    if not span.is_recording():
+        return
+    for key, value in attributes.items():
+        span.set_attribute(key, value)
 
 
-def _record_to_json(record: IdempotencyRecord) -> str:
+async def _safe_cache_get(cache_key: str) -> str | None:
+    redis = redis_client._redis
+    if redis is None:
+        return None
+    try:
+        return await redis.get(cache_key)
+    except Exception as exc:
+        logger.warning("idempotency.cache_read_failed", error=str(exc))
+        return None
+
+
+async def _safe_cache_set(cache_key: str, payload: str, ttl_seconds: int) -> None:
+    if ttl_seconds <= 0:
+        return
+    redis = redis_client._redis
+    if redis is None:
+        return
+    try:
+        await redis.set(cache_key, payload, ex=ttl_seconds)
+    except Exception as exc:
+        logger.warning("idempotency.cache_write_failed", error=str(exc))
+
+
+async def _safe_cache_delete(cache_key: str) -> None:
+    redis = redis_client._redis
+    if redis is None:
+        return
+    try:
+        await redis.delete(cache_key)
+    except Exception as exc:
+        logger.warning("idempotency.cache_delete_failed", error=str(exc))
+
+
+def _serialize_cache_record(record: IdempotencyRequest) -> str:
     return json.dumps(
         {
-            "fingerprint": record.fingerprint,
-            "status_code": record.status_code,
-            "body": record.body,
-            "is_json": record.is_json,
-            "media_type": record.media_type,
-            "headers": record.headers,
-        }
+            "record_id": str(record.id),
+            "fingerprint_hash": record.fingerprint_hash,
+            "result_type": record.result_type,
+            "result_ref": record.result_ref,
+            "response_status_code": record.response_status_code,
+            "expires_at": record.expires_at.isoformat(),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
     )
 
 
-def _cacheable_status(status_code: int) -> bool:
-    return (200 <= status_code < 300) or status_code == 409
+def _parse_cache_record(raw: str) -> _CachedReplayRecord | None:
+    try:
+        payload = json.loads(raw)
+        expires_at = datetime.fromisoformat(payload["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return _CachedReplayRecord(
+            record_id=uuid.UUID(payload["record_id"]),
+            fingerprint_hash=str(payload["fingerprint_hash"]),
+            result_type=payload.get("result_type"),
+            result_ref=IdempotencyResultRef.from_json(dict(payload["result_ref"])),
+            response_status_code=int(payload["response_status_code"]),
+            expires_at=expires_at,
+        )
+    except Exception:
+        return None
 
 
-async def require_idempotency(request: Request) -> None:
-    """Enable idempotency for a mutation endpoint when a key is supplied."""
+class IdempotencyRoute(APIRoute):
+    """Require Idempotency-Key on public mutation endpoints by default."""
 
-    if request.method.upper() not in _MUTATION_METHODS:
-        return
+    def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
+        original_handler = super().get_route_handler()
 
-    key = request.headers.get("idempotency-key")
-    if not key:
-        return
+        async def route_handler(request: Request) -> Response:
+            if (
+                request.method.upper() in _MUTATION_METHODS
+                and not getattr(self.endpoint, _SKIP_IDEMPOTENCY_ATTR, False)
+                and not request.headers.get(IDEMPOTENCY_KEY_HEADER)
+            ):
+                get_metrics().record_idempotency_request(
+                    status="missing_key",
+                    storage_source=IdempotencyStorageSource.NONE.value,
+                )
+                raise IdempotencyKeyRequiredError.default()
+            return await original_handler(request)
 
-    settings = get_settings()
-    fingerprint = await _request_fingerprint(request)
-    redis = redis_client.redis
-    cache_key = f"{IDEMPOTENCY_PREFIX}{key}"
-    lock_key = f"{LOCK_PREFIX}{key}"
+        return route_handler
 
-    cached = await redis.get(cache_key)
-    if cached:
-        record = _parse_record(cached)
-        if record.fingerprint != fingerprint:
-            raise IdempotencyPayloadMismatchError.default()
-        logger.info("idempotency.cache_hit", idempotency_key=key)
-        raise IdempotencyReplayResponse(record)
 
-    acquired = await redis.set(lock_key, fingerprint, nx=True, ex=30)
-    if not acquired:
-        locked_fingerprint = await redis.get(lock_key)
-        if locked_fingerprint and locked_fingerprint != fingerprint:
-            raise IdempotencyPayloadMismatchError.default()
+class IdempotencyExecutor:
+    """Execute a mutation once and replay completed results safely."""
 
-        for _ in range(3):
-            await asyncio.sleep(0.3)
-            cached = await redis.get(cache_key)
-            if not cached:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        policy: IdempotencyPolicy,
+    ) -> None:
+        self._session_factory = session_factory
+        self._policy = policy
+
+    async def execute(
+        self,
+        *,
+        request: Request,
+        operation: Callable[[AsyncSession], Awaitable[IdempotentOperationResult]],
+        operation_name: str | None = None,
+        policy: IdempotencyPolicy | None = None,
+    ) -> Response:
+        effective_policy = policy or self._policy
+        resolved = await _resolve_idempotency_request(
+            request,
+            policy=effective_policy,
+            operation_name=operation_name,
+        )
+
+        _annotate_span(
+            **{
+                "idempotency.scope": resolved.scope.value,
+                "idempotency.key_hash": resolved.key_hash,
+                "idempotency.endpoint": resolved.endpoint,
+            }
+        )
+
+        cached = await self._load_cached_replay(resolved)
+        if cached is not None:
+            if cached.fingerprint_hash != resolved.fingerprint_hash:
+                get_metrics().record_idempotency_request(
+                    status="mismatch",
+                    storage_source=IdempotencyStorageSource.REDIS.value,
+                )
+                raise IdempotencyPayloadMismatchError.default()
+
+            replayed = await self._replay_record(
+                request=request,
+                resolved=resolved,
+                record_id=cached.record_id,
+                storage_source=IdempotencyStorageSource.REDIS,
+            )
+            if replayed is not None:
+                return replayed
+            await _safe_cache_delete(resolved.cache_key)
+
+        claim = await self._claim_request(resolved, effective_policy)
+        if isinstance(claim, _ReplayTarget):
+            return await self._replay_record(
+                request=request,
+                resolved=resolved,
+                record_id=claim.record_id,
+                storage_source=claim.storage_source,
+            )
+
+        if isinstance(claim, _InProgressTarget):
+            get_metrics().record_idempotency_request(
+                status=IdempotencyResponseStatus.IN_PROGRESS.value,
+                storage_source=IdempotencyStorageSource.DATABASE.value,
+            )
+            raise IdempotencyInProgressError.for_retry_after(claim.retry_after_seconds)
+
+        return await self._execute_claimed_operation(
+            request=request,
+            resolved=resolved,
+            claim=claim,
+            effective_policy=effective_policy,
+            operation=operation,
+        )
+
+    async def _load_cached_replay(
+        self,
+        resolved: _ResolvedIdempotencyRequest,
+    ) -> _CachedReplayRecord | None:
+        raw = await _safe_cache_get(resolved.cache_key)
+        if raw is None:
+            return None
+
+        cached = _parse_cache_record(raw)
+        if cached is None or cached.expires_at <= _utcnow():
+            await _safe_cache_delete(resolved.cache_key)
+            return None
+        return cached
+
+    async def _claim_request(
+        self,
+        resolved: _ResolvedIdempotencyRequest,
+        policy: IdempotencyPolicy,
+    ) -> _ClaimedRequest | _ReplayTarget | _InProgressTarget:
+        lease_owner = uuid.uuid4().hex
+        lease_expires_at = _utcnow() + timedelta(seconds=policy.processing_lease_seconds)
+
+        while True:
+            try:
+                async with self._session_factory() as session:
+                    async with session.begin():
+                        record = await session.scalar(
+                            select(IdempotencyRequest).where(
+                                IdempotencyRequest.scope == resolved.scope.value,
+                                IdempotencyRequest.idempotency_key == resolved.key,
+                            )
+                        )
+                        now = _utcnow()
+                        if record is None:
+                            record = IdempotencyRequest(
+                                scope=resolved.scope.value,
+                                idempotency_key=resolved.key,
+                                endpoint=resolved.endpoint,
+                                fingerprint_hash=resolved.fingerprint_hash,
+                                fingerprint_version=resolved.fingerprint_version,
+                                status=IdempotencyRecordStatus.PROCESSING.value,
+                                lease_owner=lease_owner,
+                                lease_expires_at=lease_expires_at,
+                                expires_at=now + timedelta(seconds=policy.retention_seconds),
+                            )
+                            session.add(record)
+                            await session.flush()
+                            return _ClaimedRequest(
+                                record_id=record.id,
+                                lease_owner=lease_owner,
+                                lease_stolen=False,
+                            )
+
+                        if record.expires_at <= now:
+                            await session.delete(record)
+                            continue
+
+                        if (
+                            record.fingerprint_hash != resolved.fingerprint_hash
+                            or record.fingerprint_version != resolved.fingerprint_version
+                        ):
+                            get_metrics().record_idempotency_request(
+                                status="mismatch",
+                                storage_source=IdempotencyStorageSource.DATABASE.value,
+                            )
+                            raise IdempotencyPayloadMismatchError.default()
+
+                        if record.status == IdempotencyRecordStatus.COMPLETED.value:
+                            return _ReplayTarget(
+                                record_id=record.id,
+                                storage_source=IdempotencyStorageSource.DATABASE,
+                            )
+
+                        if (
+                            record.lease_expires_at is not None
+                            and record.lease_expires_at > now
+                        ):
+                            retry_after = max(
+                                1,
+                                int((record.lease_expires_at - now).total_seconds()),
+                            )
+                            return _InProgressTarget(retry_after_seconds=retry_after)
+
+                        record.status = IdempotencyRecordStatus.PROCESSING.value
+                        record.lease_owner = lease_owner
+                        record.lease_expires_at = lease_expires_at
+                        record.endpoint = resolved.endpoint
+                        record.result_type = None
+                        record.result_ref = None
+                        record.response_status_code = None
+                        record.error_code = None
+                        record.expires_at = now + timedelta(seconds=policy.retention_seconds)
+                        await session.flush()
+                        get_metrics().record_idempotency_lease_steal()
+                        logger.warning(
+                            "idempotency.lease_reclaimed",
+                            idempotency_key_hash=resolved.key_hash,
+                            scope=resolved.scope.value,
+                            endpoint=resolved.endpoint,
+                        )
+                        return _ClaimedRequest(
+                            record_id=record.id,
+                            lease_owner=lease_owner,
+                            lease_stolen=True,
+                        )
+            except IntegrityError:
                 continue
 
-            record = _parse_record(cached)
-            if record.fingerprint != fingerprint:
-                raise IdempotencyPayloadMismatchError.default()
-            logger.info("idempotency.cache_hit", idempotency_key=key)
-            raise IdempotencyReplayResponse(record)
-
-        raise IdempotencyInProgressError.default()
-
-    request.state.idempotency_context = IdempotencyContext(
-        key=key,
-        fingerprint=fingerprint,
-        ttl=settings.idempotency_ttl,
-        lock_key=lock_key,
-        cache_key=cache_key,
-    )
-
-
-class IdempotencyMiddleware(BaseHTTPMiddleware):
-    """Persist completed idempotent responses after the endpoint returns."""
-
-    def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
-
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        try:
-            response = await call_next(request)
-        except Exception:
-            context = getattr(request.state, "idempotency_context", None)
-            if context is not None:
-                await redis_client.redis.delete(context.lock_key)
-            raise
-
-        context = getattr(request.state, "idempotency_context", None)
-        if context is None or not _cacheable_status(response.status_code):
-            if context is not None:
-                await redis_client.redis.delete(context.lock_key)
-            return response
-
-        body = b""
-        async for chunk in response.body_iterator:
-            body += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
-
-        response.body_iterator = iterate_in_threadpool(iter([body]))
-        await _store_response(
-            context,
-            response.status_code,
-            [
-                (key.encode("latin1"), value.encode("latin1"))
-                for key, value in response.headers.items()
-            ],
-            [body],
+    async def _execute_claimed_operation(
+        self,
+        *,
+        request: Request,
+        resolved: _ResolvedIdempotencyRequest,
+        claim: _ClaimedRequest,
+        effective_policy: IdempotencyPolicy,
+        operation: Callable[[AsyncSession], Awaitable[IdempotentOperationResult]],
+    ) -> Response:
+        stop_renewal = asyncio.Event()
+        renewal_task = asyncio.create_task(
+            self._renew_lease(
+                record_id=claim.record_id,
+                lease_owner=claim.lease_owner,
+                stop_signal=stop_renewal,
+                policy=effective_policy,
+            )
         )
-        await redis_client.redis.delete(context.lock_key)
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    record = await session.get(IdempotencyRequest, claim.record_id)
+                    if record is None or record.lease_owner != claim.lease_owner:
+                        raise IdempotencyInProgressError.default()
+
+                    result = await operation(session)
+                    response = result.response
+                    should_persist = result.should_persist()
+                    if should_persist:
+                        record.status = IdempotencyRecordStatus.COMPLETED.value
+                        record.lease_owner = None
+                        record.lease_expires_at = None
+                        record.result_type = result.result_type or result.result_ref.serializer
+                        record.result_ref = result.result_ref.as_json()
+                        record.response_status_code = response.status_code
+                        record.error_code = result.error_code
+                    else:
+                        await session.delete(record)
+
+                response.headers[IDEMPOTENCY_KEY_HEADER] = resolved.key
+                if should_persist:
+                    await self._cache_record(
+                        resolved=resolved,
+                        record_id=claim.record_id,
+                        policy=effective_policy,
+                    )
+                    response.headers[IDEMPOTENCY_STATUS_HEADER] = (
+                        IdempotencyResponseStatus.CREATED.value
+                    )
+                    get_metrics().record_idempotency_request(
+                        status=IdempotencyResponseStatus.CREATED.value,
+                        storage_source=IdempotencyStorageSource.DATABASE.value,
+                    )
+                    _annotate_span(
+                        **{
+                            "idempotency.status": IdempotencyResponseStatus.CREATED.value,
+                            "idempotency.storage_source": (
+                                IdempotencyStorageSource.DATABASE.value
+                            ),
+                        }
+                    )
+                return response
+        except Exception:
+            await self._release_claim(claim.record_id, claim.lease_owner, resolved.cache_key)
+            raise
+        finally:
+            stop_renewal.set()
+            renewal_task.cancel()
+            try:
+                await renewal_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _replay_record(
+        self,
+        *,
+        request: Request,
+        resolved: _ResolvedIdempotencyRequest,
+        record_id: uuid.UUID,
+        storage_source: IdempotencyStorageSource,
+    ) -> Response | None:
+        async with self._session_factory() as session:
+            async with session.begin():
+                record = await session.get(IdempotencyRequest, record_id)
+                if record is None or record.status != IdempotencyRecordStatus.COMPLETED.value:
+                    return None
+
+                now = _utcnow()
+                if record.expires_at <= now:
+                    await session.delete(record)
+                    return None
+
+                if (
+                    record.fingerprint_hash != resolved.fingerprint_hash
+                    or record.fingerprint_version != resolved.fingerprint_version
+                ):
+                    raise IdempotencyPayloadMismatchError.default()
+
+                if record.result_ref is None or record.response_status_code is None:
+                    raise RuntimeError("Completed idempotency record is missing replay metadata.")
+
+                result_ref = IdempotencyResultRef.from_json(dict(record.result_ref))
+                serializer = _serializer_registry.serializer_for(result_ref.serializer)
+                response = await serializer.build_response(
+                    request=request,
+                    session=session,
+                    result_ref=result_ref,
+                    response_status_code=record.response_status_code,
+                    result_type=record.result_type,
+                )
+                record.replay_count += 1
+                record.last_replayed_at = now
+
+        response.headers[IDEMPOTENCY_KEY_HEADER] = resolved.key
+        response.headers[IDEMPOTENCY_STATUS_HEADER] = IdempotencyResponseStatus.REPLAYED.value
+        get_metrics().record_idempotency_request(
+            status=IdempotencyResponseStatus.REPLAYED.value,
+            storage_source=storage_source.value,
+        )
+        _annotate_span(
+            **{
+                "idempotency.status": IdempotencyResponseStatus.REPLAYED.value,
+                "idempotency.storage_source": storage_source.value,
+            }
+        )
         return response
 
+    async def _cache_record(
+        self,
+        *,
+        resolved: _ResolvedIdempotencyRequest,
+        record_id: uuid.UUID,
+        policy: IdempotencyPolicy,
+    ) -> None:
+        async with self._session_factory() as session:
+            record = await session.get(IdempotencyRequest, record_id)
+            if record is None or record.status != IdempotencyRecordStatus.COMPLETED.value:
+                return
 
-async def _store_response(
-    context: IdempotencyContext,
-    status_code: int,
-    response_headers: list[tuple[bytes, bytes]],
-    response_chunks: list[bytes],
-) -> None:
-    body = b"".join(response_chunks)
-    header_map = {
-        key.decode("latin1"): value.decode("latin1")
-        for key, value in response_headers
-    }
-    media_type = header_map.get("content-type")
-    filtered_headers = {
-        key: value
-        for key, value in header_map.items()
-        if key.lower() not in {"content-length", "x-request-id"}
-    }
+            ttl_seconds = policy.cache_ttl_for(record.expires_at, _utcnow())
+            if ttl_seconds <= 0:
+                return
+            await _safe_cache_set(
+                resolved.cache_key,
+                _serialize_cache_record(record),
+                ttl_seconds,
+            )
 
-    is_json = False
-    body_value: Any
-    if body:
+    async def _release_claim(
+        self,
+        record_id: uuid.UUID,
+        lease_owner: str,
+        cache_key: str,
+    ) -> None:
+        await _safe_cache_delete(cache_key)
         try:
-            body_value = json.loads(body)
-            is_json = True
-        except json.JSONDecodeError:
-            body_value = body.decode("utf-8", errors="replace")
-    else:
-        body_value = None
+            async with self._session_factory() as session:
+                async with session.begin():
+                    record = await session.get(IdempotencyRequest, record_id)
+                    if record is None:
+                        return
+                    if record.lease_owner != lease_owner:
+                        return
+                    if record.status == IdempotencyRecordStatus.PROCESSING.value:
+                        await session.delete(record)
+        except Exception as exc:
+            logger.warning("idempotency.release_failed", error=str(exc))
 
-    record = IdempotencyRecord(
-        fingerprint=context.fingerprint,
-        status_code=status_code,
-        body=body_value,
-        is_json=is_json,
-        media_type=media_type,
-        headers=filtered_headers,
+    async def _renew_lease(
+        self,
+        *,
+        record_id: uuid.UUID,
+        lease_owner: str,
+        stop_signal: asyncio.Event,
+        policy: IdempotencyPolicy,
+    ) -> None:
+        interval_seconds = max(1, policy.processing_lease_seconds // 3)
+        while True:
+            try:
+                await asyncio.wait_for(stop_signal.wait(), timeout=interval_seconds)
+                return
+            except TimeoutError:
+                pass
+
+            try:
+                async with self._session_factory() as session:
+                    async with session.begin():
+                        record = await session.get(IdempotencyRequest, record_id)
+                        if record is None:
+                            return
+                        if (
+                            record.lease_owner != lease_owner
+                            or record.status != IdempotencyRecordStatus.PROCESSING.value
+                        ):
+                            return
+                        record.lease_expires_at = _utcnow() + timedelta(
+                            seconds=policy.processing_lease_seconds
+                        )
+            except Exception as exc:
+                logger.warning("idempotency.lease_renewal_failed", error=str(exc))
+
+
+@lru_cache
+def get_idempotency_executor() -> IdempotencyExecutor:
+    settings = get_settings()
+    return IdempotencyExecutor(
+        session_factory=get_async_session_factory(),
+        policy=IdempotencyPolicy.from_settings(settings),
     )
-    await redis_client.redis.set(
-        context.cache_key,
-        _record_to_json(record),
-        ex=context.ttl,
-    )
-    logger.info("idempotency.stored", idempotency_key=context.key)
+
+
+async def cleanup_expired_idempotency_requests(
+    *,
+    batch_size: int | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> int:
+    settings = get_settings()
+    effective_batch_size = batch_size or settings.idempotency_cleanup_batch_size
+    effective_session_factory = session_factory or get_async_session_factory()
+    deleted_rows: list[tuple[str, str]] = []
+
+    async with effective_session_factory() as session:
+        async with session.begin():
+            now = _utcnow()
+            records = (
+                await session.scalars(
+                    select(IdempotencyRequest)
+                    .where(IdempotencyRequest.expires_at <= now)
+                    .order_by(IdempotencyRequest.expires_at.asc())
+                    .limit(effective_batch_size)
+                )
+            ).all()
+            for record in records:
+                deleted_rows.append((record.scope, record.idempotency_key))
+                await session.delete(record)
+
+    for scope_value, key in deleted_rows:
+        await _safe_cache_delete(_cache_key(scope_value, key))
+
+    return len(deleted_rows)
+
+
+__all__ = [
+    "IDEMPOTENCY_KEY_HEADER",
+    "IDEMPOTENCY_STATUS_HEADER",
+    "IdempotencyExecutor",
+    "IdempotencyPolicy",
+    "IdempotencyResultRef",
+    "IdempotencyResponseStatus",
+    "IdempotencyRoute",
+    "IdempotencyScope",
+    "IdempotencyScopeKind",
+    "IdempotentOperationResult",
+    "cleanup_expired_idempotency_requests",
+    "get_idempotency_executor",
+    "register_idempotency_serializer",
+    "reset_idempotency_serializers",
+    "skip_idempotency",
+    "unregister_idempotency_serializer",
+]

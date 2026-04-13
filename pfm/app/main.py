@@ -11,7 +11,11 @@ from fastapi.openapi.utils import get_openapi
 
 from app.config import get_settings
 from app.core.analytics import create_analytics_service
-from app.core.idempotency import IdempotencyMiddleware
+from app.core.idempotency import (
+    IDEMPOTENCY_KEY_HEADER,
+    IDEMPOTENCY_STATUS_HEADER,
+    IdempotencyRoute,
+)
 from app.core.logging import configure_logging
 from app.core.rate_limit import RateLimitTier, initialize_rate_limiting, rate_limit
 from app.core.responses import ProblemFieldError, ProblemResponse, ProblemUpstream
@@ -116,6 +120,7 @@ def _common_problem_responses() -> dict[int, dict[str, Any]]:
         413: {"model": ProblemResponse, "description": "Request Too Large"},
         415: {"model": ProblemResponse, "description": "Unsupported Media Type"},
         422: {"model": ProblemResponse, "description": "Validation Failed"},
+        428: {"model": ProblemResponse, "description": "Idempotency Key Required"},
         429: {"model": ProblemResponse, "description": "Rate Limited"},
         500: {"model": ProblemResponse, "description": "Internal Server Error"},
         503: {"model": ProblemResponse, "description": "Dependency Unavailable"},
@@ -160,6 +165,7 @@ def _install_openapi_schema(app: FastAPI) -> None:
         responses["Problem413"] = _problem_response_component("Request Too Large")
         responses["Problem415"] = _problem_response_component("Unsupported Media Type")
         responses["Problem422"] = _problem_response_component("Validation Failed")
+        responses["Problem428"] = _problem_response_component("Idempotency Key Required")
         responses["Problem429"] = _problem_response_component("Rate Limited")
         responses["Problem500"] = _problem_response_component("Internal Server Error")
         responses["Problem503"] = _problem_response_component("Dependency Unavailable")
@@ -183,10 +189,10 @@ def create_app() -> ASGIAppWrapper:
     app.state.shutting_down = False
     app.state.telemetry_runtime = None
     app.state.analytics = None
+    app.router.route_class = IdempotencyRoute
 
     app.add_middleware(RequestTimeoutMiddleware, timeout_seconds=settings.request_timeout)
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=settings.request_max_body_size)
-    app.add_middleware(IdempotencyMiddleware)
     app.add_middleware(SecurityHeadersMiddleware, is_production=settings.is_production)
     app.add_middleware(UserContextMiddleware)
     app.add_middleware(
@@ -220,11 +226,11 @@ def create_app() -> ASGIAppWrapper:
         allow_headers=[
             "Authorization",
             "Content-Type",
+            IDEMPOTENCY_KEY_HEADER,
             "X-Anonymous-ID",
             "X-Request-ID",
-            "X-Idempotency-Key",
         ],
-        expose_headers=["X-Request-ID", "Idempotent-Replayed"],
+        expose_headers=["X-Request-ID", IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_STATUS_HEADER],
     )
     return ASGIAppWrapper(app, outer_app)
 

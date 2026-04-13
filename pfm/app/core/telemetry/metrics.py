@@ -19,6 +19,8 @@ class MetricName(StrEnum):
     API_ERRORS = "http.server.errors"
     OUTBOUND_REQUESTS = "http.client.requests"
     OUTBOUND_REQUEST_DURATION = "http.client.duration"
+    IDEMPOTENCY_REQUESTS = "idempotency.requests"
+    IDEMPOTENCY_LEASE_STEALS = "idempotency.lease_steals"
     TASKS_DISPATCHED = "worker.tasks.dispatched"
     TASKS_IN_FLIGHT = "worker.tasks.in_flight"
 
@@ -51,6 +53,17 @@ METRIC_DEFINITIONS: dict[MetricName, MetricDefinition] = {
         description="Outbound HTTP request duration in milliseconds.",
         unit="ms",
         allowed_attributes=frozenset({"service", "method", "status_class"}),
+    ),
+    MetricName.IDEMPOTENCY_REQUESTS: MetricDefinition(
+        name=MetricName.IDEMPOTENCY_REQUESTS,
+        kind=MetricKind.COUNTER,
+        description="Count of idempotent request outcomes.",
+        allowed_attributes=frozenset({"status", "storage_source"}),
+    ),
+    MetricName.IDEMPOTENCY_LEASE_STEALS: MetricDefinition(
+        name=MetricName.IDEMPOTENCY_LEASE_STEALS,
+        kind=MetricKind.COUNTER,
+        description="Count of expired idempotency leases that were reclaimed.",
     ),
     MetricName.TASKS_DISPATCHED: MetricDefinition(
         name=MetricName.TASKS_DISPATCHED,
@@ -156,6 +169,23 @@ class AppMetrics:
                 "retryable": str(retryable).lower(),
             },
         )
+
+    def record_idempotency_request(
+        self,
+        *,
+        status: str,
+        storage_source: str,
+    ) -> None:
+        self.counter(
+            MetricName.IDEMPOTENCY_REQUESTS,
+            attributes={
+                "status": status,
+                "storage_source": storage_source,
+            },
+        )
+
+    def record_idempotency_lease_steal(self) -> None:
+        self.counter(MetricName.IDEMPOTENCY_LEASE_STEALS)
 
     def record_task_dispatch(self, *, task_name: str) -> None:
         self.counter(MetricName.TASKS_DISPATCHED, attributes={"task_name": task_name})

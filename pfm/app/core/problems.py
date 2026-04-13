@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from app.config import Environment, get_settings
 from app.core.context import get_correlation_id
 from app.core.exceptions import PROBLEM_DEFINITIONS, ProblemException
+from app.core.idempotency import IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_STATUS_HEADER
 from app.core.responses import PROBLEM_JSON_MEDIA_TYPE, ProblemResponse
 
 
@@ -63,10 +64,16 @@ def problem_headers(exc: ProblemException) -> dict[str, str]:
 
 def problem_response(request: Request, exc: ProblemException) -> JSONResponse:
     document = build_problem_document(request, exc)
+    headers = problem_headers(exc)
+    request_key = request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    if request_key:
+        headers[IDEMPOTENCY_KEY_HEADER] = request_key
+    if exc.code == "idempotency_request_in_progress":
+        headers[IDEMPOTENCY_STATUS_HEADER] = "in_progress"
     return JSONResponse(
         status_code=exc.status,
         content=document.model_dump(exclude_none=True),
-        headers=problem_headers(exc),
+        headers=headers,
         media_type=PROBLEM_JSON_MEDIA_TYPE,
     )
 
