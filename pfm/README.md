@@ -98,8 +98,10 @@ This is an AI-first product. The roadmap includes streaming LLM responses, conve
 
 - FastAPI, SQLAlchemy, Redis, and HTTPX are instrumented through a shared telemetry runtime in `app/core/telemetry/`
 - Celery worker and beat processes bootstrap the same runtime shape with role-specific OTEL resources (`pfm-worker`, `pfm-beat`)
-- Structured logs stay on stdout/stderr and include `correlation_id`, `trace_id`, and `span_id` when a span is active
+- Structured logs are unified across app, stdlib, and worker processes, stay on stdout/stderr, and include `request_id`, `trace_id`, and `span_id` when a span is active
+- The API owns canonical request-completion logs; Uvicorn access logs are disabled in the blessed runner path
 - Staging and production are collector-first: traces and metrics export to an OpenTelemetry Collector via OTLP
+- The full design and contributor guide live in `docs/observability.md`
 
 ### Categorization Engine
 
@@ -139,7 +141,7 @@ cp .env.example .env
 alembic upgrade head
 
 # Start the API server
-uvicorn app.main:app --reload
+python -m app.run_api --reload
 ```
 
 ### Verify
@@ -179,6 +181,14 @@ async def list_transactions(db: AsyncSession = Depends(get_db)):
 from app.api.transactions import router as transactions_router
 api_router.include_router(transactions_router)
 ```
+
+Observability guidance for new endpoints:
+
+- Keep routes thin and move orchestration into `app/services/`
+- Add a business span with `operation_span()` in the service, not in every helper
+- Use structured logs for important lifecycle events only
+- If the route enqueues background work, publish through `dispatch_task()`
+- See `docs/observability.md` and the transaction import flow for the reference pattern
 
 ### Adding a new database model
 
@@ -237,6 +247,14 @@ def categorize_batch(transaction_ids: list[str]):
 
 2. The task is auto-discovered via the `include` list in `celery_app.py`.
 
+Observability guidance for new tasks:
+
+- Inherit from `BaseTask`
+- Wrap the main business step in `operation_span()`
+- Emit a small number of high-signal logs like `*.completed` or `*.failed`
+- Do not call `apply_async()` directly from feature code; use `dispatch_task()`
+- See `docs/observability.md` for the full task pattern
+
 ### Adding engine functionality
 
 Engine code lives in `app/engine/` and must be **framework-agnostic**:
@@ -289,7 +307,7 @@ async def test_health_check(client):
 ### Local development
 ```bash
 docker-compose up postgres redis -d    # Just DB + cache
-uvicorn app.main:app --reload           # API server
+python -m app.run_api --reload          # API server
 celery -A app.workers.celery_app worker # Background worker (separate terminal)
 ```
 

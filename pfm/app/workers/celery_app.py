@@ -1,10 +1,12 @@
 import atexit
+import sys
 
 from celery import Celery
 from celery.schedules import crontab
 from celery.signals import (
     beat_embedded_init,
     beat_init,
+    setup_logging,
     worker_process_init,
     worker_process_shutdown,
 )
@@ -15,7 +17,16 @@ from app.core.logging import configure_logging
 from app.core.telemetry import TelemetryProcessRole, bootstrap_worker_telemetry
 
 settings = get_settings()
-configure_logging(settings.environment, settings.observability.log_level)
+
+
+def _detect_process_role() -> TelemetryProcessRole:
+    argv = {arg.lower() for arg in sys.argv[1:]}
+    if "beat" in argv:
+        return TelemetryProcessRole.BEAT
+    return TelemetryProcessRole.WORKER
+
+
+configure_logging(settings, _detect_process_role())
 
 celery_app = Celery(
     "pfm",
@@ -52,6 +63,8 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     # Graceful shutdown
     worker_cancel_long_running_tasks_on_connection_loss=True,
+    worker_hijack_root_logger=False,
+    worker_redirect_stdouts=False,
 )
 
 celery_app.conf.beat_schedule = {
@@ -76,6 +89,11 @@ celery_app.conf.beat_schedule = {
 _telemetry_runtime = None
 
 
+@setup_logging.connect(weak=False)
+def _configure_celery_logging(*args, **kwargs) -> None:
+    configure_logging(settings, _detect_process_role())
+
+
 def _shutdown_telemetry(*args, **kwargs) -> None:
     global _telemetry_runtime
     if _telemetry_runtime is not None:
@@ -86,6 +104,7 @@ def _shutdown_telemetry(*args, **kwargs) -> None:
 @worker_process_init.connect(weak=False)
 def _bootstrap_worker_telemetry(*args, **kwargs) -> None:
     global _telemetry_runtime
+    configure_logging(settings, TelemetryProcessRole.WORKER)
     _telemetry_runtime = bootstrap_worker_telemetry(TelemetryProcessRole.WORKER, settings)
 
 
@@ -93,6 +112,7 @@ def _bootstrap_worker_telemetry(*args, **kwargs) -> None:
 @beat_embedded_init.connect(weak=False)
 def _bootstrap_beat_telemetry(*args, **kwargs) -> None:
     global _telemetry_runtime
+    configure_logging(settings, TelemetryProcessRole.BEAT)
     _telemetry_runtime = bootstrap_worker_telemetry(TelemetryProcessRole.BEAT, settings)
 
 

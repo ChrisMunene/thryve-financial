@@ -1,12 +1,16 @@
 """Tests for telemetry bootstrap and metrics."""
 
+from contextlib import contextmanager
+
 import pytest
 from fastapi import FastAPI
+from opentelemetry.trace import SpanKind
 
 from app.config import Settings
 from app.core.telemetry import MetricName, TelemetryProcessRole
 from app.core.telemetry import bootstrap as telemetry_bootstrap
 from app.core.telemetry.metrics import AppMetrics
+from app.core.telemetry.tracing import operation_span
 
 
 class _FakeMetricReader:
@@ -129,6 +133,35 @@ class _FakeFastAPIInstrumentor:
 
 class _FakeAsyncEngine:
     sync_engine = object()
+
+
+class _FakeSpan:
+    def __init__(self):
+        self.attributes = {}
+
+    def is_recording(self):
+        return True
+
+    def set_attribute(self, key, value):
+        self.attributes[key] = value
+
+
+class _FakeTracer:
+    def __init__(self):
+        self.calls = []
+
+    @contextmanager
+    def start_as_current_span(self, name, *, kind, attributes):
+        span = _FakeSpan()
+        self.calls.append(
+            {
+                "name": name,
+                "kind": kind,
+                "attributes": attributes,
+                "span": span,
+            }
+        )
+        yield span
 
 
 def _patch_bootstrap_dependencies(monkeypatch):
@@ -317,3 +350,34 @@ def test_metrics_facade_validates_attributes_and_caches_instruments():
             MetricName.OUTBOUND_REQUESTS,
             attributes={"service": "plaid", "path": "/secret"},
         )
+
+
+def test_operation_span_filters_sensitive_and_null_attributes(monkeypatch):
+    fake_tracer = _FakeTracer()
+    monkeypatch.setattr(
+        "app.core.telemetry.tracing.trace.get_tracer",
+        lambda name: fake_tracer,
+    )
+
+    with operation_span(
+        "transactions.import",
+        attributes={
+            "task_name": "categorization",
+            "attempt": 2,
+            "retryable": True,
+            "email": None,
+            "api_key": "secret",
+            "payload": {"nested": "value"},
+        },
+    ) as span:
+        span.set_attribute("deleted_count", 7)
+
+    call = fake_tracer.calls[0]
+    assert call["name"] == "transactions.import"
+    assert call["kind"] == SpanKind.INTERNAL
+    assert call["attributes"] == {
+        "task_name": "categorization",
+        "attempt": 2,
+        "retryable": True,
+    }
+    assert call["span"].attributes["deleted_count"] == 7

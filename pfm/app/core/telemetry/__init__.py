@@ -7,6 +7,7 @@ from .bootstrap import (
     bootstrap_worker_telemetry,
 )
 from .metrics import AppMetrics, MetricDefinition, MetricName, get_metrics
+from .tracing import operation_span
 
 __all__ = [
     "AppMetrics",
@@ -17,4 +18,5 @@ __all__ = [
     "bootstrap_api_telemetry",
     "bootstrap_worker_telemetry",
     "get_metrics",
+    "operation_span",
 ]

@@ -4,12 +4,15 @@ Base Celery task with built-in retry, correlation ID, and structured logging.
 All app tasks should inherit from BaseTask.
 """
 
+import uuid
+
 import structlog
 from celery import Task
 from opentelemetry.propagate import inject
 
 from app.core.context import clear_correlation_id, set_correlation_id
 from app.core.telemetry import get_metrics
+from app.core.telemetry.tracing import operation_span
 
 logger = structlog.get_logger()
 
@@ -35,7 +38,6 @@ class BaseTask(Task):
             "task.started",
             task_name=self.name,
             task_id=task_id,
-            correlation_id=correlation_id,
         )
 
     def on_success(self, retval, task_id, args, kwargs):
@@ -47,7 +49,9 @@ class BaseTask(Task):
             task_name=self.name,
             task_id=task_id,
             error=str(exc),
+            exception_type=type(exc).__name__,
             retry_count=self.request.retries,
+            exc_info=(type(exc), exc, exc.__traceback__),
         )
 
     def on_retry(self, exc, task_id, args, kwargs, einfo):
@@ -64,12 +68,55 @@ class BaseTask(Task):
         clear_correlation_id()
 
 
-def dispatch_task(task, *args, **kwargs):
+def _dispatch_log_context(
+    *,
+    task_name: str,
+    task_id: str,
+    apply_async_options: dict[str, object],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "task_name": task_name,
+        "task_id": task_id,
+    }
+    for key in ("queue", "routing_key", "countdown", "eta"):
+        value = apply_async_options.get(key)
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def dispatch_task(task, *args, apply_async_options: dict[str, object] | None = None, **kwargs):
     """Dispatch a task with correlation ID from the current request context."""
     from app.core.context import get_correlation_id
 
+    task_name = getattr(task, "name", "unknown")
+    options = dict(apply_async_options or {})
+    task_id = str(options.get("task_id") or uuid.uuid4())
+    options["task_id"] = task_id
+
     correlation_id = get_correlation_id()
-    headers = {"correlation_id": correlation_id} if correlation_id else {}
+    headers = dict(options.pop("headers", {}))
+    if correlation_id:
+        headers["correlation_id"] = correlation_id
     inject(headers)
-    get_metrics().record_task_dispatch(task_name=getattr(task, "name", "unknown"))
-    return task.apply_async(args=args, kwargs=kwargs, headers=headers)
+    log_context = _dispatch_log_context(
+        task_name=task_name,
+        task_id=task_id,
+        apply_async_options=options,
+    )
+
+    with operation_span("task.enqueue", attributes=log_context):
+        try:
+            result = task.apply_async(args=args, kwargs=kwargs, headers=headers, **options)
+        except Exception as exc:
+            logger.error(
+                "task.dispatch_failed",
+                exception_type=type(exc).__name__,
+                exc_info=(type(exc), exc, exc.__traceback__),
+                **log_context,
+            )
+            raise
+
+        logger.info("task.dispatched", **log_context)
+        get_metrics().record_task_dispatch(task_name=task_name)
+        return result

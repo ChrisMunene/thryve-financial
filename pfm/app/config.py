@@ -66,6 +66,12 @@ class TelemetryExporter(StrEnum):
     OTLP = "otlp"
 
 
+class LogFormat(StrEnum):
+    AUTO = "auto"
+    CONSOLE = "console"
+    JSON = "json"
+
+
 class ObservabilityConfig(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", populate_by_name=True)
 
@@ -173,8 +179,24 @@ class ObservabilityConfig(BaseSettings):
         validation_alias=AliasChoices("OTEL_SERVICE_NAME_BEAT", "beat_service_name"),
     )
     log_level: str = Field(
-        default="DEBUG",
-        validation_alias=AliasChoices("OTEL_LOG_LEVEL", "log_level"),
+        default="INFO",
+        validation_alias=AliasChoices("LOG_LEVEL", "OTEL_LOG_LEVEL", "log_level"),
+    )
+    log_format: LogFormat = Field(
+        default=LogFormat.AUTO,
+        validation_alias=AliasChoices("LOG_FORMAT", "log_format"),
+    )
+    log_requests: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("LOG_REQUESTS", "log_requests"),
+    )
+    log_healthcheck_requests: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("LOG_HEALTHCHECK_REQUESTS", "log_healthcheck_requests"),
+    )
+    log_options_requests: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("LOG_OPTIONS_REQUESTS", "log_options_requests"),
     )
     posthog_api_key: str = Field(
         default="",
@@ -227,6 +249,13 @@ class ObservabilityConfig(BaseSettings):
     def normalize_log_level(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.strip().upper()
+        return value
+
+    @field_validator("log_format", mode="before")
+    @classmethod
+    def normalize_log_format(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
         return value
 
     def signal_endpoint(self, signal: str) -> str:

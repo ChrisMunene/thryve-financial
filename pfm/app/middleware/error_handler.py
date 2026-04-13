@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import traceback
 from collections.abc import Sequence
 
 import structlog
@@ -70,6 +69,13 @@ def _problem_field_errors(exc: RequestValidationError) -> list[ProblemFieldError
     return errors
 
 
+def _route_path(request: Request) -> str | None:
+    route = request.scope.get("route")
+    if route is None:
+        return None
+    return getattr(route, "path", None) or getattr(route, "path_format", None)
+
+
 def _request_has_body(request: Request) -> bool:
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -117,7 +123,9 @@ def _log_problem(
     request: Request,
     exc: ProblemException,
     *,
-    traceback_text: str | None = None,
+    event_name: str = "request.problem",
+    exc_info: BaseException | tuple[type[BaseException], BaseException, object] | None = None,
+    exception_type: str | None = None,
 ) -> None:
     upstream_context = {}
     if exc.upstream is not None:
@@ -129,18 +137,21 @@ def _log_problem(
 
     log_method = getattr(logger, exc.log_level, logger.error)
     payload = {
-        "code": exc.code,
-        "status": exc.status,
+        "error_code": exc.code,
+        "status_code": exc.status,
         "retryable": exc.retryable,
         "path": request.url.path,
         "method": request.method,
         **upstream_context,
         **exc.extra_log_context,
     }
-    if traceback_text is not None:
-        payload["traceback"] = traceback_text
+    route = _route_path(request)
+    if route is not None:
+        payload["route"] = route
+    if exception_type is not None:
+        payload["exception_type"] = exception_type
 
-    log_method("api.problem", **payload)
+    log_method(event_name, exc_info=exc_info, **payload)
     get_metrics().record_api_error(
         code=exc.code,
         status_code=exc.status,
@@ -180,7 +191,12 @@ def register_error_handlers(app: FastAPI, debug: bool = False) -> None:
 
     @app.exception_handler(Exception)
     async def handle_unhandled_exception(request: Request, exc: Exception) -> Response:
-        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         problem = InternalServerProblem.default()
-        _log_problem(request, problem, traceback_text=tb)
+        _log_problem(
+            request,
+            problem,
+            event_name="request.unhandled_exception",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            exception_type=type(exc).__name__,
+        )
         return problem_response(request, problem)

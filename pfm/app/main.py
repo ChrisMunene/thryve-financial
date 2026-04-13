@@ -20,7 +20,7 @@ from app.core.logging import configure_logging
 from app.core.rate_limit import RateLimitTier, initialize_rate_limiting, rate_limit
 from app.core.responses import ProblemFieldError, ProblemResponse, ProblemUpstream
 from app.core.security import SecurityHeadersMiddleware
-from app.core.telemetry import bootstrap_api_telemetry
+from app.core.telemetry import TelemetryProcessRole, bootstrap_api_telemetry
 from app.middleware.correlation import (
     CorrelationIdMiddleware,
     generate_correlation_id,
@@ -28,6 +28,7 @@ from app.middleware.correlation import (
 )
 from app.middleware.error_handler import register_error_handlers
 from app.middleware.operational import BodySizeLimitMiddleware, RequestTimeoutMiddleware
+from app.middleware.request_logging import RequestLoggingMiddleware
 from app.middleware.request_id import ResponseRequestIdMiddleware
 from app.middleware.user_context import UserContextMiddleware
 
@@ -67,7 +68,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.telemetry_runtime = None
     app.state.analytics = create_analytics_service()
 
-    configure_logging(settings.environment, settings.observability.log_level)
     app.state.telemetry_runtime = bootstrap_api_telemetry(app, settings)
 
     from app.db.redis import redis_client
@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await redis_client.initialize()
     await initialize_rate_limiting()
 
-    logger.info("app.started", environment=settings.environment.value)
+    logger.info("app.started")
 
     yield
 
@@ -179,6 +179,7 @@ def _install_openapi_schema(app: FastAPI) -> None:
 
 def create_app() -> ASGIAppWrapper:
     settings = get_settings()
+    configure_logging(settings, TelemetryProcessRole.API)
 
     app = FastAPI(
         title="PFM API",
@@ -194,6 +195,12 @@ def create_app() -> ASGIAppWrapper:
     app.add_middleware(RequestTimeoutMiddleware, timeout_seconds=settings.request_timeout)
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=settings.request_max_body_size)
     app.add_middleware(SecurityHeadersMiddleware, is_production=settings.is_production)
+    app.add_middleware(
+        RequestLoggingMiddleware,
+        enabled=settings.observability.log_requests,
+        log_healthcheck_requests=settings.observability.log_healthcheck_requests,
+        log_options_requests=settings.observability.log_options_requests,
+    )
     app.add_middleware(UserContextMiddleware)
     app.add_middleware(
         CorrelationIdMiddleware,

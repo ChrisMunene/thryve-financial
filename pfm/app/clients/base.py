@@ -135,10 +135,10 @@ class BaseClient:
 
                 logger.info(
                     "http.outbound",
-                    service=self._service_name,
+                    dependency=self._service_name,
                     method=method,
                     path=path,
-                    status=response.status_code,
+                    status_code=response.status_code,
                     duration_ms=duration_ms,
                     headers=_redact_headers(dict(kwargs.get("headers", {}))),
                 )
@@ -153,8 +153,8 @@ class BaseClient:
                 if response.status_code >= 500 and attempt < self._max_retries:
                     logger.warning(
                         "http.outbound.retrying",
-                        service=self._service_name,
-                        status=response.status_code,
+                        dependency=self._service_name,
+                        status_code=response.status_code,
                         attempt=attempt + 1,
                     )
                     await asyncio.sleep(self._backoff_factor * (2 ** attempt))
@@ -178,7 +178,7 @@ class BaseClient:
                 if attempt < self._max_retries:
                     logger.warning(
                         "http.outbound.timeout",
-                        service=self._service_name,
+                        dependency=self._service_name,
                         attempt=attempt + 1,
                     )
                     await asyncio.sleep(self._backoff_factor * (2 ** attempt))
@@ -192,7 +192,7 @@ class BaseClient:
                 if attempt < self._max_retries:
                     logger.warning(
                         "http.outbound.error",
-                        service=self._service_name,
+                        dependency=self._service_name,
                         error=str(e),
                         attempt=attempt + 1,
                     )

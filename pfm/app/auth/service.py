@@ -58,11 +58,7 @@ class AuthService:
             metadata=payload.metadata,
         )
 
-        logger.info(
-            "user.authenticated",
-            user_id=str(user.user_id),
-            email=user.email,
-        )
+        logger.debug("user.authenticated", user_id=str(user.user_id))
 
         # Analytics identify/track calls belong in explicit identity transition
         # flows rather than every authenticated request.

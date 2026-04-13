@@ -8,7 +8,6 @@ but adds structured logging, correlation ID propagation, and error translation.
 import structlog
 
 from app.config import get_settings
-from app.core.context import get_correlation_id
 from app.core.exceptions import DependencyUnavailableError
 from app.core.responses import ProblemUpstream
 
@@ -56,12 +55,11 @@ class AnthropicClient:
 
             logger.info(
                 "http.outbound",
-                service="anthropic",
+                dependency="anthropic",
                 model=self._model,
                 duration_ms=round(duration * 1000),
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
-                correlation_id=get_correlation_id(),
             )
 
             return response.content[0].text
@@ -70,9 +68,11 @@ class AnthropicClient:
             duration = time.monotonic() - start
             logger.error(
                 "http.outbound.error",
-                service="anthropic",
+                dependency="anthropic",
                 error=str(e),
                 duration_ms=round(duration * 1000),
+                exception_type=type(e).__name__,
+                exc_info=(type(e), e, e.__traceback__),
             )
             raise DependencyUnavailableError.for_service(
                 "anthropic",
