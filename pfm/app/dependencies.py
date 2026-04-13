@@ -12,12 +12,14 @@ from fastapi import Depends, Request
 from app.auth.delegate import AuthDelegate
 from app.auth.schemas import CurrentUser
 from app.auth.service import AuthService
+from app.clients.plaid import PlaidClient, get_plaid_client
 from app.core.exceptions import AuthenticationRequiredError, PermissionDeniedError
 from app.db.session import get_db as get_db
+from app.services.transactions import TransactionImportService
 
 # --- Auth ---
 
-__all__ = ["get_db"]
+__all__ = ["get_current_user", "get_db", "get_transaction_import_service"]
 
 
 _auth_delegate: AuthDelegate | None = None
@@ -36,6 +38,12 @@ def _get_auth_service(
     delegate: AuthDelegate = Depends(_get_auth_delegate),
 ) -> AuthService:
     return AuthService(delegate=delegate)
+
+
+def get_transaction_import_service(
+    plaid_client: PlaidClient = Depends(get_plaid_client),
+) -> TransactionImportService:
+    return TransactionImportService(plaid_client=plaid_client)
 
 
 async def get_current_user(

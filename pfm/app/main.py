@@ -52,10 +52,12 @@ class ASGIAppWrapper:
 async def _cleanup_resources() -> None:
     """Dispose of async resources during shutdown."""
     from app.clients.anthropic import close_client as close_anthropic
+    from app.clients.plaid import close_client as close_plaid
     from app.db.redis import redis_client
     from app.db.session import get_engine
 
     await close_anthropic()
+    await close_plaid()
     await get_engine().dispose()
     await redis_client.close()
 
