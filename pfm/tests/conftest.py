@@ -68,6 +68,7 @@ class FakeRedisPipeline:
 class FakeRedis:
     def __init__(self):
         self._data = {}
+        self._lists = {}
         self._sorted_sets = {}
         self._ttl = {}
 
@@ -93,13 +94,17 @@ class FakeRedis:
 
     async def delete(self, key):
         self._data.pop(key, None)
+        self._lists.pop(key, None)
         self._sorted_sets.pop(key, None)
 
     async def scan_iter(self, match=None):
-        keys = list(self._data.keys()) + list(self._sorted_sets.keys())
+        keys = list(self._data.keys()) + list(self._lists.keys()) + list(self._sorted_sets.keys())
         for key in keys:
             if match is None or fnmatch.fnmatch(key, match):
                 yield key
+
+    async def llen(self, key):
+        return len(self._lists.get(key, []))
 
     def zremrangebyscore(self, key, min_score, max_score):
         bucket = self._sorted_sets.setdefault(key, [])

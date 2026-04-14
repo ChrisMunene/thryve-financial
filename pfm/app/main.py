@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from importlib.metadata import version
+import time
 from typing import Any
 
 import structlog
@@ -67,6 +68,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings = get_settings()
 
     app.state.shutting_down = False
+    app.state.started_at_monotonic = time.monotonic()
     app.state.telemetry_runtime = None
     app.state.analytics = create_analytics_service()
 
@@ -190,6 +192,7 @@ def create_app() -> ASGIAppWrapper:
         lifespan=lifespan,
     )
     app.state.shutting_down = False
+    app.state.started_at_monotonic = time.monotonic()
     app.state.telemetry_runtime = None
     app.state.analytics = None
     app.router.route_class = IdempotencyRoute
