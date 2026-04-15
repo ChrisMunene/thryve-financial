@@ -6,14 +6,14 @@ from typing import Any
 import pytest
 from fastapi import Depends
 
-from app.core.analytics import (
+from app.core.analytics.analytics import (
     EVENT_NAME_PATTERN,
     AnalyticsIdentity,
     AnalyticsService,
     ConsoleAnalyticsDelegate,
     get_analytics,
 )
-from app.core.analytics_posthog import PostHogAnalyticsDelegate
+from app.core.analytics.analytics_posthog import PostHogAnalyticsDelegate
 from app.core.context import (
     clear_current_anonymous_id,
     clear_current_user_id,

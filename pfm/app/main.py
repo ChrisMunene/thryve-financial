@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
 from app.config import get_settings
-from app.core.analytics import create_analytics_service
+from app.core.analytics.analytics import create_analytics_service
 from app.core.idempotency import (
     IDEMPOTENCY_KEY_HEADER,
     IDEMPOTENCY_STATUS_HEADER,

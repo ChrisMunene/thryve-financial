@@ -18,7 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.auth.mock import MockAuthService
 from app.auth.principal import Principal
 from app.config import get_settings
-from app.core.analytics import AnalyticsService, ConsoleAnalyticsDelegate
+from app.core.analytics.analytics import AnalyticsService, ConsoleAnalyticsDelegate
 from app.core.idempotency import (
     IDEMPOTENCY_KEY_HEADER,
     IDEMPOTENCY_STATUS_HEADER,

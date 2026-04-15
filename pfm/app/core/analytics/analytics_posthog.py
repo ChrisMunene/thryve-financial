@@ -9,7 +9,7 @@ from typing import Any
 
 import structlog
 
-from app.core.analytics import AnalyticsIdentity
+from app.core.analytics.analytics import AnalyticsIdentity
 
 logger = structlog.get_logger()
 

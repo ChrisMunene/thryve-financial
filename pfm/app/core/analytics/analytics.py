@@ -209,7 +209,7 @@ def create_analytics_service() -> AnalyticsService:
     delegates: list[AnalyticsDelegate] = [ConsoleAnalyticsDelegate()]
 
     if settings.observability.posthog_api_key:
-        from app.core.analytics_posthog import PostHogAnalyticsDelegate
+        from app.core.analytics.analytics_posthog import PostHogAnalyticsDelegate
 
         delegates.append(
             PostHogAnalyticsDelegate(

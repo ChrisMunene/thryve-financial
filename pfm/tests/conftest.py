@@ -12,7 +12,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.auth.mock import MockAuthService
-from app.core.analytics import AnalyticsService, ConsoleAnalyticsDelegate
+from app.core.analytics.analytics import AnalyticsService, ConsoleAnalyticsDelegate
 from app.db.redis import redis_client
 from app.dependencies import get_auth_service
 from app.main import create_app
