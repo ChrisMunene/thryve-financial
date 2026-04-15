@@ -39,9 +39,43 @@ class RedisConfig(BaseSettings):
 class AuthConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AUTH_", extra="ignore")
 
-    supabase_jwt_secret: SecretStr = SecretStr("")
     supabase_url: str = ""
-    supabase_jwks_url: str = ""  # Reserved for future JWKS support
+    issuer: str = ""
+    audience: str = ""
+    supabase_anon_key: SecretStr = SecretStr("")
+    supabase_jwt_secret: SecretStr = SecretStr("")
+    supabase_jwks_url: str = ""
+    accepted_algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
+    required_claims: list[str] = Field(
+        default_factory=lambda: ["iss", "aud", "sub", "exp", "iat"]
+    )
+    clock_skew_seconds: int = 60
+    jwks_cache_ttl_seconds: int = 300
+    jwks_refresh_timeout_seconds: float = 5.0
+
+    @field_validator("accepted_algorithms", "required_claims", mode="before")
+    @classmethod
+    def parse_string_lists(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @property
+    def resolved_issuer(self) -> str:
+        if self.issuer:
+            return self.issuer.rstrip("/")
+        if self.supabase_url:
+            return f"{self.supabase_url.rstrip('/')}/auth/v1"
+        return ""
+
+    @property
+    def resolved_jwks_url(self) -> str:
+        if self.supabase_jwks_url:
+            return self.supabase_jwks_url
+        issuer = self.resolved_issuer
+        if issuer:
+            return f"{issuer}/.well-known/jwks.json"
+        return ""
 
 
 class PlaidConfig(BaseSettings):
@@ -371,8 +405,12 @@ class Settings(BaseSettings):
         """Crash on startup if required values are missing in staging/production."""
         if self.environment in (Environment.STAGING, Environment.PRODUCTION):
             missing = []
-            if not self.auth.supabase_jwt_secret.get_secret_value():
-                missing.append("AUTH_SUPABASE_JWT_SECRET")
+            if not self.auth.supabase_url:
+                missing.append("AUTH_SUPABASE_URL")
+            if not self.auth.audience:
+                missing.append("AUTH_AUDIENCE")
+            if not self.auth.supabase_anon_key.get_secret_value():
+                missing.append("AUTH_SUPABASE_ANON_KEY")
             if not self.anthropic.api_key.get_secret_value():
                 missing.append("ANTHROPIC_API_KEY")
             if not self.plaid.client_id:
@@ -431,6 +469,12 @@ class Settings(BaseSettings):
         for name, value in self.rate_limit.model_dump().items():
             if value <= 0:
                 raise ValueError(f"rate_limit.{name} must be greater than 0")
+        if self.auth.clock_skew_seconds < 0:
+            raise ValueError("auth.clock_skew_seconds must be greater than or equal to 0")
+        if self.auth.jwks_cache_ttl_seconds <= 0:
+            raise ValueError("auth.jwks_cache_ttl_seconds must be greater than 0")
+        if self.auth.jwks_refresh_timeout_seconds <= 0:
+            raise ValueError("auth.jwks_refresh_timeout_seconds must be greater than 0")
         return self
 
     @field_validator("environment", mode="before")

@@ -5,11 +5,12 @@ from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import get_settings
+from app.models import auth_identity  # noqa: F401
 from app.models import idempotency  # noqa: F401
+from app.models import user  # noqa: F401
 from app.models.base import Base
 
 # Import all models here so autogenerate sees them
-# from app.models.user import User  # noqa: F401 — uncomment as models are added
 
 config = context.config
 if config.config_file_name is not None:

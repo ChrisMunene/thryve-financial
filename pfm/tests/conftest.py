@@ -2,7 +2,7 @@
 Shared test fixtures.
 
 - FastAPI test client with async httpx
-- Mock auth delegate auto-wired
+- Mock auth service auto-wired
 - DI overrides applied
 """
 
@@ -11,10 +11,10 @@ import fnmatch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.auth.mock import MockAuthDelegate
+from app.auth.mock import MockAuthService
 from app.core.analytics import AnalyticsService, ConsoleAnalyticsDelegate
 from app.db.redis import redis_client
-from app.dependencies import _get_auth_delegate
+from app.dependencies import get_auth_service
 from app.main import create_app
 
 
@@ -144,9 +144,9 @@ def app(fake_redis):
     application = create_app()
     application.state.shutting_down = False
     application.state.analytics = AnalyticsService(delegates=[ConsoleAnalyticsDelegate()])
-    # Override auth to use mock delegate in tests
-    mock_delegate = MockAuthDelegate()
-    application.dependency_overrides[_get_auth_delegate] = lambda: mock_delegate
+    # Override auth to use a mock service in tests.
+    mock_auth_service = MockAuthService()
+    application.dependency_overrides[get_auth_service] = lambda: mock_auth_service
     return application
 
 

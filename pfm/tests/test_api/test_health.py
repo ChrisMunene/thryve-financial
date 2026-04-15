@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from app.api import health
+from app.auth.mock import MockAuthService
 
 
 class _HealthySession:
@@ -30,7 +31,7 @@ async def test_health_check_returns_operational_snapshot(app, client, monkeypatc
     monkeypatch.setattr(
         health,
         "_auth_health_check",
-        _async_return(health.AuthHealthCheck(status="healthy", provider="SupabaseAuthDelegate")),
+        _async_return(health.AuthHealthCheck(status="healthy", provider="supabase")),
     )
     monkeypatch.setattr(
         health,
@@ -52,7 +53,7 @@ async def test_health_check_returns_operational_snapshot(app, client, monkeypatc
         "checks": {
             "database": {"status": "healthy", "latency_ms": 2},
             "redis": {"status": "healthy", "latency_ms": 1},
-            "auth": {"status": "healthy", "provider": "SupabaseAuthDelegate"},
+            "auth": {"status": "healthy", "provider": "supabase"},
             "celery": {
                 "status": "healthy",
                 "workers": 4,
@@ -65,7 +66,7 @@ async def test_health_check_returns_operational_snapshot(app, client, monkeypatc
 
 
 def _async_return(value):
-    async def _inner():
+    async def _inner(*args, **kwargs):
         return value
 
     return _inner
@@ -88,7 +89,7 @@ async def test_health_check_surfaces_unhealthy_dependencies(app, client, monkeyp
     monkeypatch.setattr(
         health,
         "_auth_health_check",
-        _async_return(health.AuthHealthCheck(status="unhealthy", provider="MockAuthDelegate")),
+        _async_return(health.AuthHealthCheck(status="unhealthy", provider="mock")),
     )
     monkeypatch.setattr(
         health,
@@ -110,7 +111,7 @@ async def test_health_check_surfaces_unhealthy_dependencies(app, client, monkeyp
     assert response.json()["checks"]["redis"] == {"status": "unhealthy"}
     assert response.json()["checks"]["auth"] == {
         "status": "unhealthy",
-        "provider": "MockAuthDelegate",
+        "provider": "mock",
     }
     assert response.json()["checks"]["celery"] == {
         "status": "unhealthy",
@@ -120,17 +121,17 @@ async def test_health_check_surfaces_unhealthy_dependencies(app, client, monkeyp
     assert response.json()["uptime_seconds"] == 15
 
 
-async def test_auth_health_check_uses_delegate_validation(monkeypatch):
-    class HealthyDelegate:
+async def test_auth_health_check_uses_provider_validation():
+    class HealthyAuthService:
+        provider_name = "healthy"
+
         def validate_configuration(self):
             return None
 
-    monkeypatch.setattr(health, "_get_auth_delegate", lambda: HealthyDelegate())
-
-    result = await health._auth_health_check()
+    result = await health._auth_health_check(HealthyAuthService())
 
     assert result.status == "healthy"
-    assert result.provider == "HealthyDelegate"
+    assert result.provider == "healthy"
 
 
 async def test_redis_health_check_uses_round_trip(fake_redis):
@@ -160,18 +161,16 @@ async def test_celery_health_check_surfaces_queue_depths(monkeypatch):
     assert result.queues == {"default": 5, "high": 1, "low": 0}
 
 
-async def test_readiness_returns_200_when_dependencies_ready(client, monkeypatch):
+async def test_readiness_returns_200_when_dependencies_ready(app, client, monkeypatch):
     monkeypatch.setattr(health, "get_async_session_factory", lambda: _healthy_session_factory)
 
     class HealthyAuthService:
-        def __init__(self, delegate):
-            self.delegate = delegate
+        provider_name = "healthy"
 
         def validate_configuration(self):
             return None
 
-    monkeypatch.setattr(health, "AuthService", HealthyAuthService)
-    monkeypatch.setattr(health, "_get_auth_delegate", lambda: object())
+    app.dependency_overrides[health.get_auth_service] = lambda: HealthyAuthService()
 
     response = await client.get("/api/v1/health/ready")
     assert response.status_code == 200
@@ -183,18 +182,16 @@ async def test_readiness_returns_200_when_dependencies_ready(client, monkeypatch
     }
 
 
-async def test_readiness_returns_503_when_auth_not_ready(client, monkeypatch):
+async def test_readiness_returns_503_when_auth_not_ready(app, client, monkeypatch):
     monkeypatch.setattr(health, "get_async_session_factory", lambda: _healthy_session_factory)
 
     class FailingAuthService:
-        def __init__(self, delegate):
-            self.delegate = delegate
+        provider_name = "healthy"
 
         def validate_configuration(self):
             raise RuntimeError("missing auth secret")
 
-    monkeypatch.setattr(health, "AuthService", FailingAuthService)
-    monkeypatch.setattr(health, "_get_auth_delegate", lambda: object())
+    app.dependency_overrides[health.get_auth_service] = lambda: FailingAuthService()
 
     response = await client.get("/api/v1/health/ready")
     assert response.status_code == 503
@@ -218,6 +215,7 @@ async def test_readiness_returns_503_during_shutdown(app, client):
 
 
 async def test_shutdown_flag_resets(app, client):
+    app.dependency_overrides[health.get_auth_service] = lambda: MockAuthService()
     app.state.shutting_down = True
     app.state.shutting_down = False
 

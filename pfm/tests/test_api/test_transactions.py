@@ -84,10 +84,10 @@ async def test_import_transactions_returns_202_and_uses_workflow_span(app, clien
             {"access_token": "access-sandbox-123", "cursor": "cursor-1"}
         ]
         assert span_calls[0][0] == "transactions.import"
-        assert span_calls[0][1] == {
-            "provider": "plaid",
-            "operation": "transactions.sync",
-        }
+        assert span_calls[0][1]["user_id"]
+        assert span_calls[0][1]["provider"] == "plaid"
+        assert span_calls[0][1]["operation"] == "transactions.sync"
+        assert span_calls[0][1]["subject_id"]
         assert span_calls[0][2].attributes["imported_count"] == 2
         assert span_calls[0][2].attributes["has_more"] is False
         assert dispatch_calls[0]["kwargs"]["transactions"] == [

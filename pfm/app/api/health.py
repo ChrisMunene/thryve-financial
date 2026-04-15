@@ -10,7 +10,7 @@ import time
 import uuid
 
 import structlog
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi_limiter.decorators import skip_limiter
 from sqlalchemy import text
 
@@ -20,7 +20,7 @@ from app.core.idempotency import IdempotencyRoute
 from app.core.responses import ProblemFieldError, Response, success_response
 from app.db.redis import redis_client
 from app.db.session import get_async_session_factory
-from app.dependencies import _get_auth_delegate
+from app.dependencies import get_auth_service
 from app.schemas import (
     AuthHealthCheck,
     CeleryHealthCheck,
@@ -91,14 +91,10 @@ async def _redis_health_check() -> LatencyHealthCheck:
     )
 
 
-async def _auth_health_check() -> AuthHealthCheck:
-    provider = None
+async def _auth_health_check(auth_service: AuthService) -> AuthHealthCheck:
+    provider = auth_service.provider_name
     try:
-        delegate = _get_auth_delegate()
-        provider = type(delegate).__name__
-        validator = getattr(delegate, "validate_configuration", None)
-        if callable(validator):
-            validator()
+        auth_service.validate_configuration()
     except Exception as exc:
         _log_health_check_failure("auth", exc)
         return AuthHealthCheck(
@@ -163,11 +159,14 @@ async def _celery_health_check() -> CeleryHealthCheck:
     )
 
 
-async def _build_health_response(request: Request) -> HealthResponse:
+async def _build_health_response(
+    request: Request,
+    auth_service: AuthService,
+) -> HealthResponse:
     database, redis, auth, celery = await asyncio.gather(
         _database_health_check(),
         _redis_health_check(),
-        _auth_health_check(),
+        _auth_health_check(auth_service),
         _celery_health_check(),
     )
     all_healthy = all(
@@ -216,14 +215,20 @@ def _readiness_problem(
 
 @router.get("/health", response_model=HealthResponse, response_model_exclude_none=True)
 @skip_limiter
-async def liveness(request: Request) -> HealthResponse:
+async def liveness(
+    request: Request,
+    auth_service: AuthService = Depends(get_auth_service),
+) -> HealthResponse:
     """Operational health snapshot with dependency checks."""
-    return await _build_health_response(request)
+    return await _build_health_response(request, auth_service)
 
 
 @router.get("/health/ready", response_model=Response[ReadinessResponseData])
 @skip_limiter
-async def readiness(request: Request) -> Response[ReadinessResponseData]:
+async def readiness(
+    request: Request,
+    auth_service: AuthService = Depends(get_auth_service),
+) -> Response[ReadinessResponseData]:
     """Deep readiness check. Verifies DB, Redis, auth configuration, and reports status."""
     if request.app.state.shutting_down:
         raise _readiness_problem(
@@ -253,7 +258,6 @@ async def readiness(request: Request) -> Response[ReadinessResponseData]:
 
     # Auth readiness check
     try:
-        auth_service = AuthService(delegate=_get_auth_delegate())
         auth_service.validate_configuration()
         _mark_dependency_healthy(dependencies, "auth")
     except Exception as e:

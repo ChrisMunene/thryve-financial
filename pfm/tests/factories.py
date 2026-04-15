@@ -8,19 +8,20 @@ Usage:
 
 import uuid
 
-from app.auth.schemas import CurrentUser
+from app.auth.principal import Principal
 
 
-def create_current_user(**overrides) -> CurrentUser:
-    """Create a CurrentUser for testing."""
+def create_principal(**overrides) -> Principal:
+    """Create a Principal for testing."""
     defaults = {
+        "subject_id": str(uuid.uuid4()),
         "user_id": uuid.uuid4(),
         "email": "test@example.com",
         "roles": ["user"],
         "metadata": {},
     }
     defaults.update(overrides)
-    return CurrentUser(**defaults)
+    return Principal(**defaults)
 
 
 # Additional factories (create_user, create_transaction) will be added

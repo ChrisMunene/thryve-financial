@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from uuid import UUID
 
 import structlog
 
@@ -30,6 +31,8 @@ class TransactionImportService:
     async def import_transactions(
         self,
         *,
+        user_id: UUID,
+        subject_id: str,
         access_token: str,
         cursor: str | None = None,
     ) -> TransactionImportResult:
@@ -38,6 +41,8 @@ class TransactionImportService:
         with operation_span(
             "transactions.import",
             attributes={
+                "user_id": str(user_id),
+                "subject_id": subject_id,
                 "provider": "plaid",
                 "operation": "transactions.sync",
             },
@@ -60,6 +65,8 @@ class TransactionImportService:
 
         logger.info(
             "transactions.import_accepted",
+            user_id=str(user_id),
+            subject_id=subject_id,
             provider="plaid",
             task_id=queued_task.id,
             imported_count=imported_count,

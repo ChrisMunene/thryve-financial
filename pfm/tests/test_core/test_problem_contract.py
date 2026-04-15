@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import httpx
-from fastapi import Body, Depends, Query
+from fastapi import Body, Depends, Query, Security
 from httpx import ASGITransport, AsyncClient
 
-from app.auth.mock import MockAuthDelegate
+from app.auth.mock import MockAuthService
 from app.clients.base import BaseClient
 from app.core.responses import success_response
 from app.core.user_actions import UserAction
-from app.dependencies import _get_auth_delegate, get_current_user, require_role
+from app.dependencies import get_auth_service, require_auth, require_roles
 
 
 class _TimeoutClient(BaseClient):
@@ -114,8 +114,8 @@ async def test_query_validation_returns_422_with_field_errors(app, client):
 
 async def test_missing_bearer_token_returns_401_with_challenge(app, client):
     @app.get("/probe-auth")
-    async def probe_auth(user=Depends(get_current_user)):
-        return {"user_id": str(user.user_id)}
+    async def probe_auth(principal=Security(require_auth)):
+        return {"subject_id": principal.subject_id}
 
     response = await client.get("/probe-auth")
 
@@ -125,7 +125,7 @@ async def test_missing_bearer_token_returns_401_with_challenge(app, client):
 
 
 async def test_insufficient_role_returns_403_without_challenge(app, client):
-    @app.get("/probe-admin", dependencies=[Depends(require_role("admin"))])
+    @app.get("/probe-admin", dependencies=[Depends(require_roles("admin"))])
     async def probe_admin():
         return {"ok": True}
 
@@ -214,11 +214,11 @@ async def test_problem_docs_surface_default_user_action(client):
 
 
 async def test_admin_route_can_be_authorized_with_override(app, client):
-    @app.get("/probe-admin-override", dependencies=[Depends(require_role("admin"))])
+    @app.get("/probe-admin-override", dependencies=[Depends(require_roles("admin"))])
     async def probe_admin_override():
         return {"ok": True}
 
-    app.dependency_overrides[_get_auth_delegate] = lambda: MockAuthDelegate(roles=["admin"])
+    app.dependency_overrides[get_auth_service] = lambda: MockAuthService(roles=["admin"])
     response = await client.get(
         "/probe-admin-override",
         headers={"authorization": "Bearer token-123"},

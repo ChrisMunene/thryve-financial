@@ -271,6 +271,40 @@ class AuthenticationRequiredError(ProblemException):
         return cls.default(extra_log_context={"auth_reason": "malformed_user_id"})
 
 
+class InvalidCredentialsError(ProblemException):
+    status = 401
+    type_slug = "invalid-credentials"
+    title = "Invalid Credentials"
+    code = "invalid_credentials"
+    description = "The supplied authentication credentials are invalid."
+    default_detail = "The supplied credentials are invalid."
+    default_user_action = UserAction.REAUTHENTICATE
+    allowed_user_actions = frozenset({UserAction.REAUTHENTICATE, None})
+    default_log_level = "warning"
+
+
+class InvalidVerificationCodeError(ProblemException):
+    status = 400
+    type_slug = "invalid-verification-code"
+    title = "Invalid Verification Code"
+    code = "invalid_verification_code"
+    description = "The verification code is invalid or expired."
+    default_detail = "The verification code is invalid or expired."
+    default_log_level = "warning"
+
+
+class AccountNotProvisionedError(ProblemException):
+    status = 401
+    type_slug = "account-not-provisioned"
+    title = "Account Not Provisioned"
+    code = "account_not_provisioned"
+    description = "The authenticated identity has not been provisioned for this application."
+    default_detail = "The authenticated identity is not provisioned for this application."
+    default_user_action = UserAction.CONTACT_SUPPORT
+    allowed_user_actions = frozenset({UserAction.CONTACT_SUPPORT, None})
+    default_log_level = "warning"
+
+
 class PermissionDeniedError(ProblemException):
     status = 403
     type_slug = "permission-denied"
@@ -671,6 +705,9 @@ _PROBLEM_TYPES: tuple[type[ProblemException], ...] = (
     UnsupportedMediaTypeError,
     RequestValidationProblem,
     AuthenticationRequiredError,
+    InvalidCredentialsError,
+    InvalidVerificationCodeError,
+    AccountNotProvisionedError,
     PermissionDeniedError,
     ResourceNotFoundError,
     MethodNotAllowedProblem,
@@ -743,6 +780,7 @@ IdempotencyConflictError = IdempotencyInProgressError
 __all__ = [
     "PROBLEM_DEFINITIONS",
     "AppException",
+    "AccountNotProvisionedError",
     "AuthenticationError",
     "AuthenticationRequiredError",
     "AuthorizationError",
@@ -751,6 +789,8 @@ __all__ = [
     "ExternalActionRequiredError",
     "ExternalServiceError",
     "GenericHTTPProblem",
+    "InvalidCredentialsError",
+    "InvalidVerificationCodeError",
     "IdempotencyConflictError",
     "IdempotencyKeyRequiredError",
     "IdempotencyInProgressError",

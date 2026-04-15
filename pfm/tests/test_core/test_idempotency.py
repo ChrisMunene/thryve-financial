@@ -15,8 +15,8 @@ from sqlalchemy import JSON, Integer, String, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.auth.delegate import TokenPayload
-from app.auth.mock import MockAuthDelegate
+from app.auth.mock import MockAuthService
+from app.auth.principal import Principal
 from app.config import get_settings
 from app.core.analytics import AnalyticsService, ConsoleAnalyticsDelegate
 from app.core.idempotency import (
@@ -31,7 +31,7 @@ from app.core.idempotency import (
     reset_idempotency_serializers,
 )
 from app.db.redis import redis_client
-from app.dependencies import _get_auth_delegate, get_current_user
+from app.dependencies import get_auth_service, require_auth
 from app.main import create_app
 from app.models.base import Base, TimestampMixin, UUIDMixin
 from app.models.idempotency import IdempotencyRequest
@@ -75,19 +75,33 @@ class ProbeSerializer:
         )
 
 
-class TokenScopedAuthDelegate:
+class TokenScopedAuthService:
     def __init__(self) -> None:
-        self._users = {
+        self._subjects = {
             "alice-token": str(uuid.uuid4()),
             "bob-token": str(uuid.uuid4()),
         }
+        self._user_ids = {
+            "alice-token": uuid.uuid4(),
+            "bob-token": uuid.uuid4(),
+        }
 
-    async def verify_token(self, token: str) -> TokenPayload:
-        return TokenPayload(
-            user_id=self._users[token],
-            email=f"{token}@example.com",
+    async def authenticate_request(self, access_token: str) -> Principal:
+        return Principal(
+            subject_id=self._subjects[access_token],
+            user_id=self._user_ids[access_token],
+            actor_type="user",
+            session_id=f"session:{access_token}",
+            issuer="https://test.supabase.co/auth/v1",
+            audience="authenticated",
+            email=f"{access_token}@example.com",
             roles=["user"],
+            scopes=[],
+            metadata={},
         )
+
+    def validate_configuration(self) -> None:
+        return None
 
 
 class CacheWriteFailRedis:
@@ -158,10 +172,10 @@ async def idempotency_session_factory():
 @pytest.fixture
 async def idempotency_app(fake_redis, idempotency_session_factory):
     application = create_app()
-    mock_delegate = MockAuthDelegate()
+    mock_auth_service = MockAuthService()
     application.state.shutting_down = False
     application.state.analytics = AnalyticsService(delegates=[ConsoleAnalyticsDelegate()])
-    application.dependency_overrides[_get_auth_delegate] = lambda: mock_delegate
+    application.dependency_overrides[get_auth_service] = lambda: mock_auth_service
     application.dependency_overrides[get_idempotency_executor] = lambda: IdempotencyExecutor(
         session_factory=idempotency_session_factory,
         policy=IdempotencyPolicy(
@@ -188,11 +202,11 @@ def _install_probe_route(
     app,
     *,
     call_count: dict[str, int],
-    require_auth: bool = True,
+    require_authenticated_user: bool = True,
     started: asyncio.Event | None = None,
     sleep_seconds: float = 0.0,
 ):
-    if require_auth:
+    if require_authenticated_user:
 
         @app.post("/probe-idempotent/{item_id}")
         async def probe_idempotent(
@@ -201,9 +215,9 @@ def _install_probe_route(
             payload: dict = Body(...),
             variant: str | None = Query(default=None),
             executor: IdempotencyExecutor = Depends(get_idempotency_executor),
-            current_user=Depends(get_current_user),
+            principal=Depends(require_auth),
         ):
-            actor = str(current_user.user_id)
+            actor = principal.subject_id
 
             async def operation(session: AsyncSession) -> IdempotentOperationResult:
                 if started is not None:
@@ -309,7 +323,11 @@ async def test_missing_idempotency_key_returns_428(idempotency_app, idempotency_
 
 
 async def test_anonymous_mutation_requires_valid_anonymous_id(idempotency_app, idempotency_client):
-    _install_probe_route(idempotency_app, call_count={"value": 0}, require_auth=False)
+    _install_probe_route(
+        idempotency_app,
+        call_count={"value": 0},
+        require_authenticated_user=False,
+    )
 
     response = await idempotency_client.post(
         "/probe-anonymous/widget-1",
@@ -393,8 +411,8 @@ async def test_different_users_do_not_collide_on_same_idempotency_key(
 ):
     call_count = {"value": 0}
     _install_probe_route(idempotency_app, call_count=call_count)
-    token_delegate = TokenScopedAuthDelegate()
-    idempotency_app.dependency_overrides[_get_auth_delegate] = lambda: token_delegate
+    token_auth_service = TokenScopedAuthService()
+    idempotency_app.dependency_overrides[get_auth_service] = lambda: token_auth_service
 
     alice_headers = {
         "authorization": "Bearer alice-token",

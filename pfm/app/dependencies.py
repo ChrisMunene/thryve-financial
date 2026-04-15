@@ -7,37 +7,42 @@ Tests override these via app.dependency_overrides.
 
 from collections.abc import Callable
 
-from fastapi import Depends, Request
+from fastapi import Depends, Request, Security
 
-from app.auth.delegate import AuthDelegate
-from app.auth.schemas import CurrentUser
+from app.auth.auth_context import AuthContext
+from app.auth.bearer import get_bearer_token
+from app.auth.principal import Principal
 from app.auth.service import AuthService
+from app.auth.supabase import SupabaseAuthProvider
 from app.clients.plaid import PlaidClient, get_plaid_client
-from app.core.exceptions import AuthenticationRequiredError, PermissionDeniedError
+from app.core.exceptions import PermissionDeniedError
+from app.db.session import get_async_session_factory
 from app.db.session import get_db as get_db
 from app.services.transactions import TransactionImportService
 
-# --- Auth ---
-
-__all__ = ["get_current_user", "get_db", "get_transaction_import_service"]
-
-
-_auth_delegate: AuthDelegate | None = None
-
-
-def _get_auth_delegate() -> AuthDelegate:
-    """Returns the auth delegate singleton. Override in tests with MockAuthDelegate."""
-    global _auth_delegate
-    if _auth_delegate is None:
-        from app.auth.supabase import SupabaseAuthDelegate
-        _auth_delegate = SupabaseAuthDelegate()
-    return _auth_delegate
+__all__ = [
+    "get_auth_service",
+    "require_auth",
+    "require_user",
+    "require_roles",
+    "require_scopes",
+    "get_db",
+    "get_transaction_import_service",
+]
 
 
-def _get_auth_service(
-    delegate: AuthDelegate = Depends(_get_auth_delegate),
-) -> AuthService:
-    return AuthService(delegate=delegate)
+_auth_service: AuthService | None = None
+
+
+def get_auth_service() -> AuthService:
+    """Return the application auth service singleton. Override in tests as needed."""
+    global _auth_service
+    if _auth_service is None:
+        _auth_service = AuthService(
+            provider=SupabaseAuthProvider(),
+            session_factory=get_async_session_factory(),
+        )
+    return _auth_service
 
 
 def get_transaction_import_service(
@@ -46,62 +51,53 @@ def get_transaction_import_service(
     return TransactionImportService(plaid_client=plaid_client)
 
 
-async def get_current_user(
+async def require_auth(
     request: Request,
-    auth_service: AuthService = Depends(_get_auth_service),
-) -> CurrentUser:
-    """Extract Bearer token from Authorization header and authenticate.
-
-    Returns a typed CurrentUser object.
-    Raises AuthenticationRequiredError if the token is missing or invalid.
-    """
-    auth_header = request.headers.get("authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise AuthenticationRequiredError.missing_or_invalid_authorization_header()
-
-    token = auth_header[7:]  # Strip "Bearer "
-    if not token:
-        raise AuthenticationRequiredError.empty_bearer_token()
-
-    current_user = await auth_service.authenticate(token)
-    request.state.current_user = current_user
-    request.state.user_id = str(current_user.user_id)
-    return current_user
+    token: str = Security(get_bearer_token),
+    auth_service: AuthService = Depends(get_auth_service),
+) -> Principal:
+    """Authenticate the caller and attach the trusted principal to request state."""
+    principal = await auth_service.authenticate_request(token)
+    request.state.principal = principal
+    request.state.subject_id = principal.subject_id
+    request.state.user_id = str(principal.user_id)
+    return principal
 
 
-def require_role(*required_roles: str) -> Callable:
-    """Composable dependency that checks user roles.
+async def require_user(
+    request: Request,
+    principal: Principal = Security(require_auth),
+    auth_service: AuthService = Depends(get_auth_service),
+) -> AuthContext:
+    """Load the authenticated application user together with the trusted principal."""
+    user = await auth_service.get_current_user(user_id=principal.user_id, principal=principal)
+    auth_context = AuthContext(user=user, principal=principal)
+    request.state.current_user = user
+    request.state.auth_context = auth_context
+    return auth_context
 
-    Usage:
-        @router.get("/admin", dependencies=[Depends(require_role("admin"))])
-        async def admin_endpoint(...): ...
-    """
+
+def require_roles(*required_roles: str) -> Callable:
+    """Composable dependency that checks principal roles."""
     if not required_roles:
-        raise ValueError("require_role() must be called with at least one role")
+        raise ValueError("require_roles() must be called with at least one role")
 
-    async def _check_role(
-        current_user: CurrentUser = Depends(get_current_user),
-    ) -> CurrentUser:
-        if not any(role in current_user.roles for role in required_roles):
+    async def _check_role(principal: Principal = Security(require_auth)) -> Principal:
+        if not any(role in principal.roles for role in required_roles):
             raise PermissionDeniedError.missing_role(*required_roles)
-        return current_user
+        return principal
 
     return _check_role
 
 
-def require_permission(permission: str) -> Callable:
-    """Composable dependency for future ABAC extension.
+def require_scopes(*required_scopes: str) -> Callable:
+    """Composable dependency that checks principal scopes."""
+    if not required_scopes:
+        raise ValueError("require_scopes() must be called with at least one scope")
 
-    Currently checks if the permission string is in the user's roles.
-    Will be extended to support attribute-based checks.
-    """
+    async def _check_scopes(principal: Principal = Security(require_auth)) -> Principal:
+        if not all(scope in principal.scopes for scope in required_scopes):
+            raise PermissionDeniedError.missing_permission(" ".join(required_scopes))
+        return principal
 
-    async def _check_permission(
-        current_user: CurrentUser = Depends(get_current_user),
-    ) -> CurrentUser:
-        # For now, permissions are treated as roles. Extend later.
-        if permission not in current_user.roles:
-            raise PermissionDeniedError.missing_permission(permission)
-        return current_user
-
-    return _check_permission
+    return _check_scopes

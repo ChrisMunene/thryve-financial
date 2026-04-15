@@ -103,6 +103,16 @@ This is an AI-first product. The roadmap includes streaming LLM responses, conve
 - Staging and production are collector-first: traces and metrics export to an OpenTelemetry Collector via OTLP
 - The full design and contributor guide live in `docs/observability.md`
 
+### Authentication
+
+- Protected routes use FastAPI security dependencies, not manual `Authorization` header parsing
+- `AuthService` is the single application-facing auth facade; the rest of the app does not talk to provider internals
+- Bearer tokens are verified strictly through JWT/JWKS checks and resolved into a trusted `Principal`
+- Local `users` and `auth_identities` separate app-owned users from external provider subject ids
+- Route authorization is expressed through `require_auth`, `require_user`, `require_scopes`, and `require_roles`
+- Business logic receives actor identity explicitly rather than pulling it from request state
+- The full auth design, dependency decision matrix, and route-usage cookbook live in `docs/authentication.md`
+
 ### Categorization Engine
 
 Two-layer system:
@@ -189,6 +199,15 @@ Observability guidance for new endpoints:
 - Use structured logs for important lifecycle events only
 - If the route enqueues background work, publish through `dispatch_task()`
 - See `docs/observability.md` and the transaction import flow for the reference pattern
+
+Authentication guidance for new endpoints:
+
+- Use `Security(require_auth)` for auth-only routes
+- Use `Depends(require_user)` when the route needs the local app user plus auth context
+- Use `Depends(require_scopes("some:scope"))` for auth + scope checks
+- Use `Depends(require_roles("admin"))` for role-gated routes
+- Pass `principal` and/or `auth_context` explicitly into services
+- See `docs/authentication.md` for the full design and the scenario-by-scenario usage guide
 
 ### Adding a new database model
 
@@ -322,7 +341,8 @@ See `.env.example` for all required variables. Key ones:
 - `DATABASE_URL` — Postgres connection string (asyncpg)
 - `REDIS_URL` — Redis connection string
 - `ANTHROPIC_API_KEY` — For LLM categorization layer
-- `AUTH_SUPABASE_JWT_SECRET` — For auth middleware
+- `AUTH_SUPABASE_URL` and `AUTH_AUDIENCE` — For JWT issuer and audience validation
+- `AUTH_SUPABASE_JWKS_URL` — Optional explicit JWKS endpoint override
 - `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` — `console` in development, `otlp` in staging/production
 - `OTEL_EXPORTER_OTLP_ENDPOINT` — Collector endpoint for traces and metrics in staging/production
 - `OTEL_LOGS_EXPORTER` — Must remain `none` in this refactor; logs stay on stdout/stderr

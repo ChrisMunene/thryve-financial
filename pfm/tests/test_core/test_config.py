@@ -28,11 +28,35 @@ class TestConfigDefaults:
 
 
 class TestConfigValidation:
-    def test_production_requires_auth_secret(self):
-        with pytest.raises(ValueError, match="AUTH_SUPABASE_JWT_SECRET"):
+    def test_production_requires_supabase_url(self):
+        with pytest.raises(ValueError, match="AUTH_SUPABASE_URL"):
             Settings(
                 environment="production",
-                auth={"supabase_jwt_secret": ""},
+                auth={"audience": "authenticated"},
+                anthropic={"api_key": "sk-test"},
+                plaid={"client_id": "test", "secret": "test"},
+            )
+
+    def test_production_requires_auth_audience(self):
+        with pytest.raises(ValueError, match="AUTH_AUDIENCE"):
+            Settings(
+                environment="production",
+                auth={
+                    "supabase_url": "https://x.supabase.co",
+                    "supabase_anon_key": "anon-test-key",
+                },
+                anthropic={"api_key": "sk-test"},
+                plaid={"client_id": "test", "secret": "test"},
+            )
+
+    def test_production_requires_supabase_anon_key(self):
+        with pytest.raises(ValueError, match="AUTH_SUPABASE_ANON_KEY"):
+            Settings(
+                environment="production",
+                auth={
+                    "supabase_url": "https://x.supabase.co",
+                    "audience": "authenticated",
+                },
                 anthropic={"api_key": "sk-test"},
                 plaid={"client_id": "test", "secret": "test"},
             )
@@ -41,7 +65,11 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
             Settings(
                 environment="production",
-                auth={"supabase_jwt_secret": "secret"},
+                auth={
+                    "supabase_url": "https://x.supabase.co",
+                    "audience": "authenticated",
+                    "supabase_anon_key": "anon-test-key",
+                },
                 anthropic={"api_key": ""},
                 plaid={"client_id": "test", "secret": "test"},
             )
@@ -50,7 +78,11 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="PLAID_CLIENT_ID"):
             Settings(
                 environment="production",
-                auth={"supabase_jwt_secret": "secret"},
+                auth={
+                    "supabase_url": "https://x.supabase.co",
+                    "audience": "authenticated",
+                    "supabase_anon_key": "anon-test-key",
+                },
                 anthropic={"api_key": "sk-test"},
                 plaid={"client_id": "", "secret": ""},
             )
@@ -59,7 +91,11 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="OTEL_TRACES_EXPORTER"):
             Settings(
                 environment="production",
-                auth={"supabase_jwt_secret": "secret"},
+                auth={
+                    "supabase_url": "https://x.supabase.co",
+                    "audience": "authenticated",
+                    "supabase_anon_key": "anon-test-key",
+                },
                 anthropic={"api_key": "sk-test"},
                 plaid={"client_id": "test_id", "secret": "test_secret"},
                 observability={
@@ -104,7 +140,11 @@ class TestConfigValidation:
     def test_production_valid_config_succeeds(self):
         settings = Settings(
             environment="production",
-            auth={"supabase_jwt_secret": "secret", "supabase_url": "https://x.supabase.co"},
+            auth={
+                "supabase_url": "https://x.supabase.co",
+                "audience": "authenticated",
+                "supabase_anon_key": "anon-test-key",
+            },
             anthropic={"api_key": "sk-test"},
             plaid={"client_id": "test_id", "secret": "test_secret"},
             observability={
@@ -119,12 +159,13 @@ class TestConfigValidation:
     def test_development_starts_without_secrets(self):
         settings = Settings(environment="development")
         assert settings.is_development
-        assert settings.auth.supabase_jwt_secret.get_secret_value() == ""
+        assert settings.auth.supabase_url == ""
+        assert settings.auth.audience == ""
 
     def test_environment_normalized_to_lowercase(self):
         settings = Settings(
             environment="DEVELOPMENT",
-            auth={"supabase_jwt_secret": ""},
+            auth={"supabase_url": ""},
         )
         assert settings.environment == Environment.DEVELOPMENT
 
@@ -146,7 +187,9 @@ class TestConfigValidation:
             "\n".join(
                 [
                     "DATABASE_URL=postgresql+asyncpg://from-dotenv/db",
-                    "AUTH_SUPABASE_JWT_SECRET=dotenv-secret",
+                    "AUTH_SUPABASE_URL=https://dotenv.supabase.co",
+                    "AUTH_AUDIENCE=authenticated",
+                    "AUTH_SUPABASE_ANON_KEY=anon-from-dotenv",
                     "OTEL_TRACES_EXPORTER=otlp",
                     "OTEL_METRICS_EXPORTER=otlp",
                     "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317",
@@ -155,7 +198,9 @@ class TestConfigValidation:
         )
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("DATABASE_URL", raising=False)
-        monkeypatch.delenv("AUTH_SUPABASE_JWT_SECRET", raising=False)
+        monkeypatch.delenv("AUTH_SUPABASE_URL", raising=False)
+        monkeypatch.delenv("AUTH_AUDIENCE", raising=False)
+        monkeypatch.delenv("AUTH_SUPABASE_ANON_KEY", raising=False)
         monkeypatch.delenv("OTEL_TRACES_EXPORTER", raising=False)
         monkeypatch.delenv("OTEL_METRICS_EXPORTER", raising=False)
         monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
@@ -163,7 +208,9 @@ class TestConfigValidation:
         settings = Settings()
 
         assert settings.database.url == "postgresql+asyncpg://from-dotenv/db"
-        assert settings.auth.supabase_jwt_secret.get_secret_value() == "dotenv-secret"
+        assert settings.auth.supabase_url == "https://dotenv.supabase.co"
+        assert settings.auth.audience == "authenticated"
+        assert settings.auth.supabase_anon_key.get_secret_value() == "anon-from-dotenv"
         assert settings.observability.otlp_endpoint == "http://collector:4317"
 
     def test_debug_accepts_release_string(self):
@@ -184,6 +231,32 @@ class TestConfigValidation:
             "region": "us-east-1",
             "cluster": "primary",
         }
+
+    def test_auth_derives_issuer_and_jwks_from_supabase_url(self):
+        settings = Settings(
+            environment="development",
+            auth={
+                "supabase_url": "https://x.supabase.co",
+                "audience": "authenticated",
+            },
+        )
+
+        assert settings.auth.resolved_issuer == "https://x.supabase.co/auth/v1"
+        assert settings.auth.resolved_jwks_url == (
+            "https://x.supabase.co/auth/v1/.well-known/jwks.json"
+        )
+
+    def test_auth_string_lists_parse_from_strings(self):
+        settings = Settings(
+            environment="development",
+            auth={
+                "accepted_algorithms": "RS256,ES256",
+                "required_claims": "iss,aud,sub,exp,iat",
+            },
+        )
+
+        assert settings.auth.accepted_algorithms == ["RS256", "ES256"]
+        assert settings.auth.required_claims == ["iss", "aud", "sub", "exp", "iat"]
 
 
 class TestConfigSingleton:
