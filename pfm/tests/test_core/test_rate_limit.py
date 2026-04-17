@@ -10,6 +10,7 @@ from starlette.requests import Request
 
 from app.config import Settings
 from app.core import rate_limit as rate_limit_module
+from app.db.redis import RedisService
 from app.main import create_app
 from app.middleware.error_handler import register_error_handlers
 
@@ -48,6 +49,17 @@ def _async_return(value):
         return value
 
     return _inner
+
+
+class _RecoveringRedisService:
+    def __init__(self):
+        self.is_available = False
+        self.ensure_started_calls = 0
+
+    async def ensure_started(self) -> bool:
+        self.ensure_started_calls += 1
+        self.is_available = True
+        return True
 
 
 class TestRateLimitIdentity:
@@ -126,6 +138,10 @@ class TestNamedPolicies:
             rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.AUTH)._policy
             == policies.auth
         )
+        assert (
+            rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.AUTH)._tier
+            == rate_limit_module.RateLimitTier.AUTH
+        )
 
     def test_exempt_tier_requires_skip_limiter(self):
         try:
@@ -138,11 +154,8 @@ class TestNamedPolicies:
     async def test_get_or_create_limiter_awaits_async_redis_bucket_init(self, monkeypatch):
         policy = rate_limit_module.RateLimitPolicy(10, 60)
         bucket = _FakeBucket()
-
-        rate_limit_module._LIMITER_INSTANCE_CACHE.clear()
-        rate_limit_module._LIMITER_INIT_LOCKS.clear()
-
-        monkeypatch.setattr(rate_limit_module.redis_client, "_redis", object())
+        redis_service = RedisService.with_client(object())
+        app = FastAPI()
 
         def fake_redis_bucket_init(*args, **kwargs):
             return _async_return(bucket)()
@@ -150,15 +163,73 @@ class TestNamedPolicies:
         monkeypatch.setattr(rate_limit_module.RedisBucket, "init", fake_redis_bucket_init)
         monkeypatch.setattr(rate_limit_module, "Limiter", lambda argument: {"bucket": argument})
 
-        limiter = await rate_limit_module._get_or_create_limiter(policy)
+        limiter = await rate_limit_module._get_or_create_limiter(policy, redis_service, app)
 
         assert limiter == {"bucket": bucket}
         assert not isawaitable(limiter)
+
+    async def test_get_or_create_limiter_is_scoped_to_the_app_instance(self, monkeypatch):
+        policy = rate_limit_module.RateLimitPolicy(10, 60)
+        redis_service = RedisService.with_client(object())
+        app_one = FastAPI()
+        app_two = FastAPI()
+        created_limiters: list[dict[str, object]] = []
+
+        def fake_redis_bucket_init(*args, **kwargs):
+            return _async_return(_FakeBucket())()
+
+        def fake_limiter(argument):
+            limiter = {"bucket": argument, "index": len(created_limiters)}
+            created_limiters.append(limiter)
+            return limiter
+
+        monkeypatch.setattr(rate_limit_module.RedisBucket, "init", fake_redis_bucket_init)
+        monkeypatch.setattr(rate_limit_module, "Limiter", fake_limiter)
+
+        limiter_one = await rate_limit_module._get_or_create_limiter(policy, redis_service, app_one)
+        limiter_two = await rate_limit_module._get_or_create_limiter(policy, redis_service, app_two)
+
+        assert limiter_one is not limiter_two
+        assert len(created_limiters) == 2
+
+    async def test_get_or_create_limiter_rebuilds_when_backend_generation_changes(
+        self,
+        monkeypatch,
+    ):
+        policy = rate_limit_module.RateLimitPolicy(10, 60)
+        app = FastAPI()
+        first_client = object()
+        second_client = object()
+        redis_service = RedisService.with_client(first_client)
+        created_limiters: list[dict[str, object]] = []
+
+        def fake_redis_bucket_init(*args, **kwargs):
+            return _async_return(_FakeBucket())()
+
+        def fake_limiter(argument):
+            limiter = {"bucket": argument, "index": len(created_limiters)}
+            created_limiters.append(limiter)
+            return limiter
+
+        monkeypatch.setattr(rate_limit_module.RedisBucket, "init", fake_redis_bucket_init)
+        monkeypatch.setattr(rate_limit_module, "Limiter", fake_limiter)
+
+        first_limiter = await rate_limit_module._get_or_create_limiter(policy, redis_service, app)
+
+        await redis_service.stop()
+        redis_service._client = second_client
+        redis_service._backend_generation += 1
+
+        second_limiter = await rate_limit_module._get_or_create_limiter(policy, redis_service, app)
+
+        assert first_limiter is not second_limiter
+        assert len(created_limiters) == 2
 
 
 class TestRateLimiterDependency:
     async def test_rate_limit_returns_standardized_429(self, monkeypatch):
         app = FastAPI()
+        app.state.redis = RedisService.with_client(object())
         register_error_handlers(app)
         fake_limiter = _FakeLimiter(True, False)
         monkeypatch.setattr(
@@ -201,8 +272,9 @@ class TestRateLimiterDependency:
         assert second.headers["retry-after"] == "60"
         assert second.headers["x-ratelimit-limit"] == "1"
 
-    async def test_rate_limit_fails_open_when_backend_unavailable(self, monkeypatch):
+    async def test_write_tier_returns_503_when_backend_unavailable(self, monkeypatch):
         app = FastAPI()
+        app.state.redis = RedisService.with_client(object())
         register_error_handlers(app)
 
         @app.get(
@@ -213,6 +285,158 @@ class TestRateLimiterDependency:
             return {"ok": True}
 
         monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", _async_return(None))
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get("/limited")
+
+        assert response.status_code == 503
+        assert response.json()["code"] == "dependency_unavailable"
+        assert response.headers["retry-after"] == "1"
+
+    async def test_write_tier_recovers_when_redis_was_unavailable_at_startup(self, monkeypatch):
+        app = FastAPI()
+        redis_service = _RecoveringRedisService()
+        app.state.redis = redis_service
+        register_error_handlers(app)
+
+        @app.get(
+            "/limited",
+            dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE))],
+        )
+        async def limited():
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            rate_limit_module,
+            "_get_or_create_limiter",
+            _async_return(_FakeLimiter(True)),
+        )
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get("/limited")
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        assert redis_service.ensure_started_calls == 1
+
+    async def test_auth_tier_returns_503_when_backend_unavailable(self, monkeypatch):
+        app = FastAPI()
+        app.state.redis = RedisService.with_client(object())
+        register_error_handlers(app)
+
+        @app.get(
+            "/limited",
+            dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.AUTH))],
+        )
+        async def limited():
+            return {"ok": True}
+
+        monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", _async_return(None))
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get("/limited")
+
+        assert response.status_code == 503
+        assert response.json()["code"] == "dependency_unavailable"
+        assert response.headers["retry-after"] == "1"
+
+    async def test_default_tier_fails_open_when_backend_unavailable(self, monkeypatch):
+        app = FastAPI()
+        app.state.redis = RedisService.with_client(object())
+        register_error_handlers(app)
+
+        @app.get(
+            "/limited",
+            dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.DEFAULT))],
+        )
+        async def limited():
+            return {"ok": True}
+
+        monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", _async_return(None))
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get("/limited")
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+    async def test_expensive_tier_fails_open_when_backend_unavailable(self, monkeypatch):
+        app = FastAPI()
+        app.state.redis = RedisService.with_client(object())
+        register_error_handlers(app)
+
+        @app.get(
+            "/limited",
+            dependencies=[
+                Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.EXPENSIVE))
+            ],
+        )
+        async def limited():
+            return {"ok": True}
+
+        monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", _async_return(None))
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get("/limited")
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+    async def test_write_tier_returns_503_when_limiter_runtime_errors(self, monkeypatch):
+        app = FastAPI()
+        app.state.redis = RedisService.with_client(object())
+        register_error_handlers(app)
+
+        @app.get(
+            "/limited",
+            dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.WRITE))],
+        )
+        async def limited():
+            return {"ok": True}
+
+        class _BrokenRateLimiter:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __call__(self, request, response):
+                raise RuntimeError("redis blew up")
+
+        monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", _async_return(object()))
+        monkeypatch.setattr(rate_limit_module, "PackageRateLimiter", _BrokenRateLimiter)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get("/limited")
+
+        assert response.status_code == 503
+        assert response.json()["code"] == "dependency_unavailable"
+
+    async def test_default_tier_fails_open_when_limiter_runtime_errors(self, monkeypatch):
+        app = FastAPI()
+        app.state.redis = RedisService.with_client(object())
+        register_error_handlers(app)
+
+        @app.get(
+            "/limited",
+            dependencies=[Depends(rate_limit_module.rate_limit(rate_limit_module.RateLimitTier.DEFAULT))],
+        )
+        async def limited():
+            return {"ok": True}
+
+        class _BrokenRateLimiter:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __call__(self, request, response):
+                raise RuntimeError("redis blew up")
+
+        monkeypatch.setattr(rate_limit_module, "_get_or_create_limiter", _async_return(object()))
+        monkeypatch.setattr(rate_limit_module, "PackageRateLimiter", _BrokenRateLimiter)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:

@@ -355,10 +355,8 @@ class Settings(BaseSettings):
     # Engine
     deterministic_confidence_threshold: float = 0.8
     llm_confidence_threshold: float = 0.8
-    idempotency_ttl: int = 86400  # 24 hours
     idempotency_retention_seconds: int = 604800  # 7 days
     idempotency_processing_lease_seconds: int = 300  # 5 minutes
-    idempotency_cache_ttl_seconds: int = 86400  # 24 hours
     idempotency_cleanup_batch_size: int = 1000
 
     @model_validator(mode="before")

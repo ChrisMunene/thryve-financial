@@ -7,13 +7,15 @@ Shared test fixtures.
 """
 
 import fnmatch
+import hashlib
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.auth.mock import MockAuthService
 from app.core.analytics.analytics import AnalyticsService, ConsoleAnalyticsDelegate
-from app.db.redis import redis_client
+from app.db.redis import RedisService
+from app.db.session import get_engine
 from app.dependencies import get_auth_service
 from app.main import create_app
 
@@ -71,12 +73,16 @@ class FakeRedis:
         self._lists = {}
         self._sorted_sets = {}
         self._ttl = {}
+        self._scripts = {}
 
     def pipeline(self):
         return FakeRedisPipeline(self)
 
     async def ping(self):
         return True
+
+    async def aclose(self):
+        return None
 
     async def close(self):
         return None
@@ -91,6 +97,45 @@ class FakeRedis:
         if ex is not None:
             self._ttl[key] = ex
         return True
+
+    async def script_load(self, script):
+        digest = hashlib.sha1(script.encode("utf-8")).hexdigest()
+        self._scripts[digest] = script
+        return digest
+
+    async def evalsha(self, script_hash, numkeys, *args):
+        if script_hash not in self._scripts:
+            raise RuntimeError("NOSCRIPT No matching script. Please use EVAL.")
+
+        if numkeys != 1:
+            raise ValueError("FakeRedis only supports one key for evalsha")
+
+        if len(args) < 5:
+            raise ValueError("FakeRedis received insufficient evalsha arguments")
+
+        bucket = args[0]
+        now = int(args[1])
+        space_required = int(args[2])
+        item_name = str(args[3])
+        rates_count = int(args[4])
+        rate_args = args[5:]
+
+        if len(rate_args) != rates_count * 2:
+            raise ValueError("FakeRedis received mismatched rate arguments")
+
+        entries = self._sorted_sets.setdefault(bucket, [])
+
+        for index in range(rates_count):
+            interval = int(rate_args[index * 2])
+            limit = int(rate_args[index * 2 + 1])
+            count = sum(1 for _, score in entries if now - interval <= score <= now)
+            if limit - count < space_required:
+                return index
+
+        for weight_index in range(1, space_required + 1):
+            entries.append((f"{item_name}{weight_index}", now))
+
+        return -1
 
     async def delete(self, key):
         self._data.pop(key, None)
@@ -132,22 +177,30 @@ class FakeRedis:
 
 @pytest.fixture
 def fake_redis():
-    redis = FakeRedis()
-    original = redis_client._redis
-    redis_client._redis = redis
-    yield redis
-    redis_client._redis = original
+    return FakeRedis()
 
 
 @pytest.fixture
-def app(fake_redis):
+def fake_redis_service(fake_redis):
+    return RedisService.with_client(fake_redis)
+
+
+@pytest.fixture
+def app(fake_redis_service):
     application = create_app()
     application.state.shutting_down = False
     application.state.analytics = AnalyticsService(delegates=[ConsoleAnalyticsDelegate()])
+    application.state.redis = fake_redis_service
     # Override auth to use a mock service in tests.
     mock_auth_service = MockAuthService()
     application.dependency_overrides[get_auth_service] = lambda: mock_auth_service
     return application
+
+
+@pytest.fixture(autouse=True)
+async def cleanup_database_engine():
+    yield
+    await get_engine().dispose()
 
 
 @pytest.fixture

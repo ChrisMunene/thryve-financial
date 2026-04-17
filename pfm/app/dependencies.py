@@ -7,6 +7,7 @@ Tests override these via app.dependency_overrides.
 
 from collections.abc import Callable
 
+import redis.asyncio as aioredis
 from fastapi import Depends, Request, Security
 
 from app.auth.auth_context import AuthContext
@@ -16,6 +17,7 @@ from app.auth.service import AuthService
 from app.auth.supabase import SupabaseAuthProvider
 from app.clients.plaid import PlaidClient, get_plaid_client
 from app.core.exceptions import PermissionDeniedError
+from app.db.redis import RedisService
 from app.db.session import get_async_session_factory
 from app.db.session import get_db as get_db
 from app.services.transactions import TransactionImportService
@@ -27,6 +29,7 @@ __all__ = [
     "require_roles",
     "require_scopes",
     "get_db",
+    "get_redis_service",
     "get_transaction_import_service",
 ]
 
@@ -49,6 +52,13 @@ def get_transaction_import_service(
     plaid_client: PlaidClient = Depends(get_plaid_client),
 ) -> TransactionImportService:
     return TransactionImportService(plaid_client=plaid_client)
+
+
+def get_redis_service(request: Request) -> RedisService:
+    redis_service = getattr(request.app.state, "redis", None)
+    if redis_service is None:
+        raise RuntimeError("Redis service is not initialized on app.state")
+    return redis_service
 
 
 async def require_auth(

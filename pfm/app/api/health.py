@@ -7,7 +7,6 @@ GET /api/v1/health/ready — deep readiness (DB, Redis, auth config)
 
 import asyncio
 import time
-import uuid
 
 import structlog
 from fastapi import APIRouter, Depends, Request
@@ -18,7 +17,7 @@ from app.auth.service import AuthService
 from app.core.exceptions import DependencyUnavailableError
 from app.core.idempotency import IdempotencyRoute
 from app.core.responses import ProblemFieldError, Response, success_response
-from app.db.redis import redis_client
+from app.db.redis import RedisService
 from app.db.session import get_async_session_factory
 from app.dependencies import get_auth_service
 from app.schemas import (
@@ -55,6 +54,24 @@ def _log_health_check_failure(name: str, exc: Exception) -> None:
     logger.warning("health.check_failed", check=name, error=str(exc))
 
 
+def _request_redis_service(request: Request) -> RedisService:
+    redis_service = getattr(request.app.state, "redis", None)
+    if redis_service is None:
+        raise RuntimeError("Redis service is not initialized on app.state")
+    return redis_service
+
+
+async def _ensure_started_redis(redis_service: RedisService) -> None:
+    if await redis_service.ensure_started():
+        return
+    raise RuntimeError("Redis is unavailable.")
+
+
+async def _assert_redis_ready(redis_service: RedisService) -> None:
+    await _ensure_started_redis(redis_service)
+    await redis_service.round_trip(timeout_seconds=2.0)
+
+
 async def _database_health_check() -> LatencyHealthCheck:
     started = time.perf_counter()
     try:
@@ -71,16 +88,10 @@ async def _database_health_check() -> LatencyHealthCheck:
     )
 
 
-async def _redis_health_check() -> LatencyHealthCheck:
+async def _redis_health_check(redis_service: RedisService) -> LatencyHealthCheck:
     started = time.perf_counter()
-    probe_key = f"healthcheck:{uuid.uuid4().hex}"
     try:
-        redis = redis_client.redis
-        await asyncio.wait_for(redis.set(probe_key, "ok", ex=5), timeout=2.0)
-        value = await asyncio.wait_for(redis.get(probe_key), timeout=2.0)
-        if value != "ok":
-            raise RuntimeError("Redis round-trip probe returned an unexpected value.")
-        await asyncio.wait_for(redis.delete(probe_key), timeout=2.0)
+        await _assert_redis_ready(redis_service)
     except Exception as exc:
         _log_health_check_failure("redis", exc)
         return LatencyHealthCheck(status="unhealthy")
@@ -116,12 +127,15 @@ def _celery_worker_count() -> int:
     return len(stats or {})
 
 
-async def _celery_queue_depths() -> dict[str, int]:
-    from app.workers.celery_app import celery_app
+async def _celery_queue_depths(redis_service: RedisService) -> dict[str, int]:
     from kombu.transport.redis import Channel as RedisChannel
 
+    from app.workers.celery_app import celery_app
+
+    await _ensure_started_redis(redis_service)
+
     queue_names = [queue.name for queue in celery_app.conf.task_queues]
-    redis = redis_client.redis
+    redis = redis_service.client
 
     queue_depths: dict[str, int] = {}
     for queue_name in queue_names:
@@ -135,11 +149,11 @@ async def _celery_queue_depths() -> dict[str, int]:
     return queue_depths
 
 
-async def _celery_health_check() -> CeleryHealthCheck:
+async def _celery_health_check(redis_service: RedisService) -> CeleryHealthCheck:
     try:
         workers, queue_depths = await asyncio.gather(
             asyncio.wait_for(asyncio.to_thread(_celery_worker_count), timeout=2.0),
-            asyncio.wait_for(_celery_queue_depths(), timeout=2.0),
+            asyncio.wait_for(_celery_queue_depths(redis_service), timeout=2.0),
         )
     except Exception as exc:
         _log_health_check_failure("celery", exc)
@@ -163,11 +177,12 @@ async def _build_health_response(
     request: Request,
     auth_service: AuthService,
 ) -> HealthResponse:
+    redis_service = _request_redis_service(request)
     database, redis, auth, celery = await asyncio.gather(
         _database_health_check(),
-        _redis_health_check(),
+        _redis_health_check(redis_service),
         _auth_health_check(auth_service),
-        _celery_health_check(),
+        _celery_health_check(redis_service),
     )
     all_healthy = all(
         check.status == "healthy"
@@ -250,7 +265,8 @@ async def readiness(
 
     # Redis check
     try:
-        await asyncio.wait_for(redis_client.redis.ping(), timeout=2.0)
+        redis_service = _request_redis_service(request)
+        await _assert_redis_ready(redis_service)
         _mark_dependency_healthy(dependencies, "redis")
     except Exception as e:
         _mark_dependency_unhealthy(dependencies, "redis", e)

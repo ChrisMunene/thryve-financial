@@ -30,7 +30,6 @@ from app.core.idempotency import (
     register_idempotency_serializer,
     reset_idempotency_serializers,
 )
-from app.db.redis import redis_client
 from app.dependencies import get_auth_service, require_auth
 from app.main import create_app
 from app.models.base import Base, TimestampMixin, UUIDMixin
@@ -104,44 +103,14 @@ class TokenScopedAuthService:
         return None
 
 
-class CacheWriteFailRedis:
-    def __init__(self) -> None:
-        self._data: dict[str, str] = {}
-
-    async def ping(self) -> bool:
-        return True
-
-    async def close(self) -> None:
-        return None
-
-    async def get(self, key: str) -> str | None:
-        return self._data.get(key)
-
-    async def set(self, key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
-        if key.startswith("idempotency:v2:"):
-            raise RuntimeError("cache write failed")
-        self._data[key] = value
-        return True
-
-    async def delete(self, key: str) -> None:
-        self._data.pop(key, None)
-
-
-class ExplodingRedis:
-    async def ping(self) -> bool:
-        return True
-
-    async def close(self) -> None:
-        return None
-
-    async def get(self, key: str) -> str | None:
-        raise RuntimeError("cache unavailable")
-
-    async def set(self, key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
-        raise RuntimeError("cache unavailable")
-
-    async def delete(self, key: str) -> None:
-        raise RuntimeError("cache unavailable")
+def _override_executor(app, session_factory) -> None:
+    app.dependency_overrides[get_idempotency_executor] = lambda: IdempotencyExecutor(
+        session_factory=session_factory,
+        policy=IdempotencyPolicy(
+            retention_seconds=300,
+            processing_lease_seconds=5,
+        ),
+    )
 
 
 @pytest.fixture
@@ -170,20 +139,13 @@ async def idempotency_session_factory():
 
 
 @pytest.fixture
-async def idempotency_app(fake_redis, idempotency_session_factory):
+async def idempotency_app(idempotency_session_factory):
     application = create_app()
     mock_auth_service = MockAuthService()
     application.state.shutting_down = False
     application.state.analytics = AnalyticsService(delegates=[ConsoleAnalyticsDelegate()])
     application.dependency_overrides[get_auth_service] = lambda: mock_auth_service
-    application.dependency_overrides[get_idempotency_executor] = lambda: IdempotencyExecutor(
-        session_factory=idempotency_session_factory,
-        policy=IdempotencyPolicy(
-            retention_seconds=300,
-            processing_lease_seconds=5,
-            cache_ttl_seconds=60,
-        ),
-    )
+    _override_executor(application, idempotency_session_factory)
     register_idempotency_serializer("probe", ProbeSerializer())
     try:
         yield application
@@ -542,63 +504,228 @@ async def test_expired_lease_is_reclaimed_and_then_replayed(
     assert call_count["value"] == 2
 
 
-async def test_success_survives_cache_write_failure_and_replays_from_database(
+async def test_failed_operation_releases_claim_and_retry_can_succeed(
     idempotency_app,
     idempotency_client,
+    idempotency_session_factory,
+):
+    attempt_count = {"value": 0}
+
+    @idempotency_app.post("/probe-failing/{item_id}")
+    async def probe_failing(
+        item_id: str,
+        request: Request,
+        payload: dict = Body(...),
+        executor: IdempotencyExecutor = Depends(get_idempotency_executor),
+        principal=Depends(require_auth),
+    ):
+        actor = principal.subject_id
+
+        async def operation(session: AsyncSession) -> IdempotentOperationResult:
+            attempt_count["value"] += 1
+            if attempt_count["value"] == 1:
+                raise RuntimeError("transient failure")
+
+            mutation = ProbeMutation(
+                actor=actor,
+                item_id=item_id,
+                variant=None,
+                counter=attempt_count["value"],
+                payload=payload,
+            )
+            session.add(mutation)
+            await session.flush()
+            response = JSONResponse(
+                status_code=201,
+                content={
+                    "mutation_id": str(mutation.id),
+                    "actor": actor,
+                    "item_id": item_id,
+                    "variant": None,
+                    "counter": attempt_count["value"],
+                    "payload": payload,
+                },
+            )
+            return IdempotentOperationResult(
+                response=response,
+                result_ref=IdempotencyResultRef(
+                    serializer="probe",
+                    reference={"mutation_id": str(mutation.id)},
+                ),
+            )
+
+        return await executor.execute(
+            request=request,
+            operation=operation,
+            operation_name="probe.failing",
+        )
+
+    headers = {
+        "authorization": "Bearer token-123",
+        IDEMPOTENCY_KEY_HEADER: "failing-key",
+    }
+
+    with pytest.raises(RuntimeError, match="transient failure"):
+        await idempotency_client.post(
+            "/probe-failing/widget-1",
+            json={"amount": 10},
+            headers=headers,
+        )
+
+    async with idempotency_session_factory() as session:
+        record = await session.scalar(
+            select(IdempotencyRequest).where(
+                IdempotencyRequest.idempotency_key == "failing-key"
+            )
+        )
+        assert record is None
+
+    second = await idempotency_client.post(
+        "/probe-failing/widget-1",
+        json={"amount": 10},
+        headers=headers,
+    )
+    third = await idempotency_client.post(
+        "/probe-failing/widget-1",
+        json={"amount": 10},
+        headers=headers,
+    )
+
+    assert second.status_code == 201
+    assert second.headers[IDEMPOTENCY_STATUS_HEADER] == "created"
+    assert third.status_code == 201
+    assert third.headers[IDEMPOTENCY_STATUS_HEADER] == "replayed"
+    assert third.json() == second.json()
+    assert attempt_count["value"] == 2
+
+    async with idempotency_session_factory() as session:
+        mutations = (await session.scalars(select(ProbeMutation))).all()
+        assert len(mutations) == 1
+
+
+async def test_non_persisted_responses_execute_again_for_same_key(
+    idempotency_app,
+    idempotency_client,
+    idempotency_session_factory,
+):
+    attempt_count = {"value": 0}
+
+    @idempotency_app.post("/probe-non-persisted/{item_id}")
+    async def probe_non_persisted(
+        item_id: str,
+        request: Request,
+        payload: dict = Body(...),
+        executor: IdempotencyExecutor = Depends(get_idempotency_executor),
+        principal=Depends(require_auth),
+    ):
+        actor = principal.subject_id
+
+        async def operation(session: AsyncSession) -> IdempotentOperationResult:
+            attempt_count["value"] += 1
+            return IdempotentOperationResult(
+                response=JSONResponse(
+                    status_code=400,
+                    content={
+                        "actor": actor,
+                        "item_id": item_id,
+                        "attempt": attempt_count["value"],
+                        "payload": payload,
+                    },
+                ),
+                result_ref=IdempotencyResultRef(
+                    serializer="probe",
+                    reference={"mutation_id": str(uuid.uuid4())},
+                ),
+                persist=False,
+                error_code="probe_validation_failed",
+            )
+
+        return await executor.execute(
+            request=request,
+            operation=operation,
+            operation_name="probe.non_persisted",
+        )
+
+    headers = {
+        "authorization": "Bearer token-123",
+        IDEMPOTENCY_KEY_HEADER: "non-persisted-key",
+    }
+
+    first = await idempotency_client.post(
+        "/probe-non-persisted/widget-1",
+        json={"amount": 10},
+        headers=headers,
+    )
+    second = await idempotency_client.post(
+        "/probe-non-persisted/widget-1",
+        json={"amount": 10},
+        headers=headers,
+    )
+
+    assert first.status_code == 400
+    assert second.status_code == 400
+    assert first.json()["attempt"] == 1
+    assert second.json()["attempt"] == 2
+    assert first.headers[IDEMPOTENCY_KEY_HEADER] == "non-persisted-key"
+    assert second.headers[IDEMPOTENCY_KEY_HEADER] == "non-persisted-key"
+    assert IDEMPOTENCY_STATUS_HEADER not in first.headers
+    assert IDEMPOTENCY_STATUS_HEADER not in second.headers
+    assert attempt_count["value"] == 2
+
+    async with idempotency_session_factory() as session:
+        record = await session.scalar(
+            select(IdempotencyRequest).where(
+                IdempotencyRequest.idempotency_key == "non-persisted-key"
+            )
+        )
+        assert record is None
+
+
+async def test_expired_completed_record_executes_fresh_request(
+    idempotency_app,
+    idempotency_client,
+    idempotency_session_factory,
 ):
     call_count = {"value": 0}
     _install_probe_route(idempotency_app, call_count=call_count)
-    original_redis = redis_client._redis
-    redis_client._redis = CacheWriteFailRedis()
-    try:
-        headers = {
-            "authorization": "Bearer token-123",
-            IDEMPOTENCY_KEY_HEADER: "cache-failure-key",
-        }
-        first = await idempotency_client.post(
-            "/probe-idempotent/widget-1",
-            json={"amount": 10},
-            headers=headers,
-        )
-        second = await idempotency_client.post(
-            "/probe-idempotent/widget-1",
-            json={"amount": 10},
-            headers=headers,
-        )
-    finally:
-        redis_client._redis = original_redis
+    headers = {
+        "authorization": "Bearer token-123",
+        IDEMPOTENCY_KEY_HEADER: "expired-completed-key",
+    }
 
+    first = await idempotency_client.post(
+        "/probe-idempotent/widget-1",
+        json={"amount": 10},
+        headers=headers,
+    )
     assert first.status_code == 201
+
+    async with idempotency_session_factory() as session:
+        async with session.begin():
+            record = await session.scalar(
+                select(IdempotencyRequest).where(
+                    IdempotencyRequest.idempotency_key == "expired-completed-key"
+                )
+            )
+            assert record is not None
+            assert record.status == "completed"
+            record.expires_at = record.updated_at - timedelta(seconds=10)
+
+    second = await idempotency_client.post(
+        "/probe-idempotent/widget-1",
+        json={"amount": 10},
+        headers=headers,
+    )
+    third = await idempotency_client.post(
+        "/probe-idempotent/widget-1",
+        json={"amount": 10},
+        headers=headers,
+    )
+
     assert second.status_code == 201
-    assert second.headers[IDEMPOTENCY_STATUS_HEADER] == "replayed"
-    assert second.json() == first.json()
-    assert call_count["value"] == 1
-
-
-async def test_redis_outage_falls_back_to_database(idempotency_app, idempotency_client):
-    call_count = {"value": 0}
-    _install_probe_route(idempotency_app, call_count=call_count)
-    original_redis = redis_client._redis
-    redis_client._redis = ExplodingRedis()
-    try:
-        headers = {
-            "authorization": "Bearer token-123",
-            IDEMPOTENCY_KEY_HEADER: "redis-outage-key",
-        }
-        first = await idempotency_client.post(
-            "/probe-idempotent/widget-1",
-            json={"amount": 10},
-            headers=headers,
-        )
-        second = await idempotency_client.post(
-            "/probe-idempotent/widget-1",
-            json={"amount": 10},
-            headers=headers,
-        )
-    finally:
-        redis_client._redis = original_redis
-
-    assert first.status_code == 201
-    assert second.status_code == 201
-    assert second.headers[IDEMPOTENCY_STATUS_HEADER] == "replayed"
-    assert call_count["value"] == 1
+    assert second.headers[IDEMPOTENCY_STATUS_HEADER] == "created"
+    assert second.json()["mutation_id"] != first.json()["mutation_id"]
+    assert third.status_code == 201
+    assert third.headers[IDEMPOTENCY_STATUS_HEADER] == "replayed"
+    assert third.json() == second.json()
+    assert call_count["value"] == 2

@@ -1,8 +1,8 @@
 import asyncio
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from importlib.metadata import version
-import time
 from typing import Any
 
 import structlog
@@ -22,6 +22,7 @@ from app.core.rate_limit import RateLimitTier, initialize_rate_limiting, rate_li
 from app.core.responses import ProblemFieldError, ProblemResponse, ProblemUpstream
 from app.core.security import SecurityHeadersMiddleware
 from app.core.telemetry import TelemetryProcessRole, bootstrap_api_telemetry
+from app.db.redis import build_redis_service
 from app.middleware.correlation import (
     CorrelationIdMiddleware,
     generate_correlation_id,
@@ -29,8 +30,8 @@ from app.middleware.correlation import (
 )
 from app.middleware.error_handler import register_error_handlers
 from app.middleware.operational import BodySizeLimitMiddleware, RequestTimeoutMiddleware
-from app.middleware.request_logging import RequestLoggingMiddleware
 from app.middleware.request_id import ResponseRequestIdMiddleware
+from app.middleware.request_logging import RequestLoggingMiddleware
 from app.middleware.user_context import UserContextMiddleware
 
 logger = structlog.get_logger()
@@ -50,17 +51,19 @@ class ASGIAppWrapper:
         await self._outer_app(scope, receive, send)
 
 
-async def _cleanup_resources() -> None:
+async def _cleanup_resources(app: FastAPI) -> None:
     """Dispose of async resources during shutdown."""
     from app.clients.anthropic import close_client as close_anthropic
     from app.clients.plaid import close_client as close_plaid
-    from app.db.redis import redis_client
     from app.db.session import get_engine
 
     await close_anthropic()
     await close_plaid()
     await get_engine().dispose()
-    await redis_client.close()
+
+    redis_service = getattr(app.state, "redis", None)
+    if redis_service is not None:
+        await redis_service.stop()
 
 
 @asynccontextmanager
@@ -71,13 +74,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.started_at_monotonic = time.monotonic()
     app.state.telemetry_runtime = None
     app.state.analytics = create_analytics_service()
+    if getattr(app.state, "redis", None) is None:
+        app.state.redis = build_redis_service(settings)
 
     app.state.telemetry_runtime = bootstrap_api_telemetry(app, settings)
-
-    from app.db.redis import redis_client
-
-    await redis_client.initialize()
-    await initialize_rate_limiting()
+    try:
+        await app.state.redis.start()
+    except Exception as exc:
+        logger.warning("redis.initialize_failed", error=str(exc))
+    await initialize_rate_limiting(app)
 
     logger.info("app.started")
 
@@ -87,7 +92,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.shutting_down = True
 
     try:
-        await asyncio.wait_for(_cleanup_resources(), timeout=settings.shutdown_timeout)
+        await asyncio.wait_for(_cleanup_resources(app), timeout=settings.shutdown_timeout)
     except TimeoutError:
         logger.warning("app.shutdown_timeout", timeout_seconds=settings.shutdown_timeout)
 
@@ -195,6 +200,7 @@ def create_app() -> ASGIAppWrapper:
     app.state.started_at_monotonic = time.monotonic()
     app.state.telemetry_runtime = None
     app.state.analytics = None
+    app.state.redis = build_redis_service(settings)
     app.router.route_class = IdempotencyRoute
 
     app.add_middleware(RequestTimeoutMiddleware, timeout_seconds=settings.request_timeout)

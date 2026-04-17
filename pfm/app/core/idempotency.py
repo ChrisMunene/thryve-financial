@@ -10,7 +10,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from functools import lru_cache
 from typing import Any, Protocol
 
 import structlog
@@ -30,7 +29,6 @@ from app.core.exceptions import (
     IdempotencyScopeRequiredError,
 )
 from app.core.telemetry import get_metrics
-from app.db.redis import redis_client
 from app.db.session import get_async_session_factory
 from app.models.idempotency import IdempotencyRequest
 
@@ -38,7 +36,6 @@ logger = structlog.get_logger()
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 IDEMPOTENCY_STATUS_HEADER = "Idempotency-Status"
-_CACHE_PREFIX = "idempotency:v2:"
 _MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _SKIP_IDEMPOTENCY_ATTR = "__skip_idempotency__"
 
@@ -61,7 +58,6 @@ class IdempotencyScopeKind(StrEnum):
 
 class IdempotencyStorageSource(StrEnum):
     DATABASE = "db"
-    REDIS = "redis"
     NONE = "none"
 
 
@@ -79,7 +75,6 @@ class IdempotencyScope:
 class IdempotencyPolicy:
     retention_seconds: int
     processing_lease_seconds: int
-    cache_ttl_seconds: int
     fingerprint_version: int = 1
 
     @classmethod
@@ -87,12 +82,7 @@ class IdempotencyPolicy:
         return cls(
             retention_seconds=settings.idempotency_retention_seconds,
             processing_lease_seconds=settings.idempotency_processing_lease_seconds,
-            cache_ttl_seconds=settings.idempotency_cache_ttl_seconds,
         )
-
-    def cache_ttl_for(self, expires_at: datetime, now: datetime) -> int:
-        remaining = int((expires_at - now).total_seconds())
-        return max(0, min(self.cache_ttl_seconds, remaining))
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,10 +191,6 @@ class _ResolvedIdempotencyRequest:
     fingerprint_hash: str
     fingerprint_version: int
 
-    @property
-    def cache_key(self) -> str:
-        return _cache_key(self.scope.value, self.key)
-
 
 @dataclass(frozen=True, slots=True)
 class _ClaimedRequest:
@@ -224,27 +210,12 @@ class _InProgressTarget:
     retry_after_seconds: int
 
 
-@dataclass(frozen=True, slots=True)
-class _CachedReplayRecord:
-    record_id: uuid.UUID
-    fingerprint_hash: str
-    result_type: str | None
-    result_ref: IdempotencyResultRef
-    response_status_code: int
-    expires_at: datetime
-
-
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
 def _truncate_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-
-
-def _cache_key(scope_value: str, key: str) -> str:
-    raw = f"{scope_value}:{key}"
-    return f"{_CACHE_PREFIX}{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
 
 def _json_content_type(content_type: str) -> bool:
@@ -344,72 +315,6 @@ def _annotate_span(**attributes: str) -> None:
         span.set_attribute(key, value)
 
 
-async def _safe_cache_get(cache_key: str) -> str | None:
-    redis = redis_client._redis
-    if redis is None:
-        return None
-    try:
-        return await redis.get(cache_key)
-    except Exception as exc:
-        logger.warning("idempotency.cache_read_failed", error=str(exc))
-        return None
-
-
-async def _safe_cache_set(cache_key: str, payload: str, ttl_seconds: int) -> None:
-    if ttl_seconds <= 0:
-        return
-    redis = redis_client._redis
-    if redis is None:
-        return
-    try:
-        await redis.set(cache_key, payload, ex=ttl_seconds)
-    except Exception as exc:
-        logger.warning("idempotency.cache_write_failed", error=str(exc))
-
-
-async def _safe_cache_delete(cache_key: str) -> None:
-    redis = redis_client._redis
-    if redis is None:
-        return
-    try:
-        await redis.delete(cache_key)
-    except Exception as exc:
-        logger.warning("idempotency.cache_delete_failed", error=str(exc))
-
-
-def _serialize_cache_record(record: IdempotencyRequest) -> str:
-    return json.dumps(
-        {
-            "record_id": str(record.id),
-            "fingerprint_hash": record.fingerprint_hash,
-            "result_type": record.result_type,
-            "result_ref": record.result_ref,
-            "response_status_code": record.response_status_code,
-            "expires_at": record.expires_at.isoformat(),
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-
-
-def _parse_cache_record(raw: str) -> _CachedReplayRecord | None:
-    try:
-        payload = json.loads(raw)
-        expires_at = datetime.fromisoformat(payload["expires_at"])
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        return _CachedReplayRecord(
-            record_id=uuid.UUID(payload["record_id"]),
-            fingerprint_hash=str(payload["fingerprint_hash"]),
-            result_type=payload.get("result_type"),
-            result_ref=IdempotencyResultRef.from_json(dict(payload["result_ref"])),
-            response_status_code=int(payload["response_status_code"]),
-            expires_at=expires_at,
-        )
-    except Exception:
-        return None
-
-
 class IdempotencyRoute(APIRoute):
     """Require Idempotency-Key on public mutation endpoints by default."""
 
@@ -467,62 +372,33 @@ class IdempotencyExecutor:
             }
         )
 
-        cached = await self._load_cached_replay(resolved)
-        if cached is not None:
-            if cached.fingerprint_hash != resolved.fingerprint_hash:
-                get_metrics().record_idempotency_request(
-                    status="mismatch",
-                    storage_source=IdempotencyStorageSource.REDIS.value,
+        while True:
+            claim = await self._claim_request(resolved, effective_policy)
+            if isinstance(claim, _ReplayTarget):
+                replay = await self._replay_record(
+                    request=request,
+                    resolved=resolved,
+                    record_id=claim.record_id,
+                    storage_source=claim.storage_source,
                 )
-                raise IdempotencyPayloadMismatchError.default()
+                if replay is not None:
+                    return replay
+                continue
 
-            replayed = await self._replay_record(
+            if isinstance(claim, _InProgressTarget):
+                get_metrics().record_idempotency_request(
+                    status=IdempotencyResponseStatus.IN_PROGRESS.value,
+                    storage_source=IdempotencyStorageSource.DATABASE.value,
+                )
+                raise IdempotencyInProgressError.for_retry_after(claim.retry_after_seconds)
+
+            return await self._execute_claimed_operation(
                 request=request,
                 resolved=resolved,
-                record_id=cached.record_id,
-                storage_source=IdempotencyStorageSource.REDIS,
+                claim=claim,
+                effective_policy=effective_policy,
+                operation=operation,
             )
-            if replayed is not None:
-                return replayed
-            await _safe_cache_delete(resolved.cache_key)
-
-        claim = await self._claim_request(resolved, effective_policy)
-        if isinstance(claim, _ReplayTarget):
-            return await self._replay_record(
-                request=request,
-                resolved=resolved,
-                record_id=claim.record_id,
-                storage_source=claim.storage_source,
-            )
-
-        if isinstance(claim, _InProgressTarget):
-            get_metrics().record_idempotency_request(
-                status=IdempotencyResponseStatus.IN_PROGRESS.value,
-                storage_source=IdempotencyStorageSource.DATABASE.value,
-            )
-            raise IdempotencyInProgressError.for_retry_after(claim.retry_after_seconds)
-
-        return await self._execute_claimed_operation(
-            request=request,
-            resolved=resolved,
-            claim=claim,
-            effective_policy=effective_policy,
-            operation=operation,
-        )
-
-    async def _load_cached_replay(
-        self,
-        resolved: _ResolvedIdempotencyRequest,
-    ) -> _CachedReplayRecord | None:
-        raw = await _safe_cache_get(resolved.cache_key)
-        if raw is None:
-            return None
-
-        cached = _parse_cache_record(raw)
-        if cached is None or cached.expires_at <= _utcnow():
-            await _safe_cache_delete(resolved.cache_key)
-            return None
-        return cached
 
     async def _claim_request(
         self,
@@ -659,11 +535,6 @@ class IdempotencyExecutor:
 
                 response.headers[IDEMPOTENCY_KEY_HEADER] = resolved.key
                 if should_persist:
-                    await self._cache_record(
-                        resolved=resolved,
-                        record_id=claim.record_id,
-                        policy=effective_policy,
-                    )
                     response.headers[IDEMPOTENCY_STATUS_HEADER] = (
                         IdempotencyResponseStatus.CREATED.value
                     )
@@ -681,7 +552,7 @@ class IdempotencyExecutor:
                     )
                 return response
         except Exception:
-            await self._release_claim(claim.record_id, claim.lease_owner, resolved.cache_key)
+            await self._release_claim(claim.record_id, claim.lease_owner)
             raise
         finally:
             stop_renewal.set()
@@ -745,34 +616,11 @@ class IdempotencyExecutor:
         )
         return response
 
-    async def _cache_record(
-        self,
-        *,
-        resolved: _ResolvedIdempotencyRequest,
-        record_id: uuid.UUID,
-        policy: IdempotencyPolicy,
-    ) -> None:
-        async with self._session_factory() as session:
-            record = await session.get(IdempotencyRequest, record_id)
-            if record is None or record.status != IdempotencyRecordStatus.COMPLETED.value:
-                return
-
-            ttl_seconds = policy.cache_ttl_for(record.expires_at, _utcnow())
-            if ttl_seconds <= 0:
-                return
-            await _safe_cache_set(
-                resolved.cache_key,
-                _serialize_cache_record(record),
-                ttl_seconds,
-            )
-
     async def _release_claim(
         self,
         record_id: uuid.UUID,
         lease_owner: str,
-        cache_key: str,
     ) -> None:
-        await _safe_cache_delete(cache_key)
         try:
             async with self._session_factory() as session:
                 async with session.begin():
@@ -820,7 +668,6 @@ class IdempotencyExecutor:
                 logger.warning("idempotency.lease_renewal_failed", error=str(exc))
 
 
-@lru_cache
 def get_idempotency_executor() -> IdempotencyExecutor:
     settings = get_settings()
     return IdempotencyExecutor(
@@ -837,8 +684,6 @@ async def cleanup_expired_idempotency_requests(
     settings = get_settings()
     effective_batch_size = batch_size or settings.idempotency_cleanup_batch_size
     effective_session_factory = session_factory or get_async_session_factory()
-    deleted_rows: list[tuple[str, str]] = []
-
     async with effective_session_factory() as session:
         async with session.begin():
             now = _utcnow()
@@ -851,13 +696,9 @@ async def cleanup_expired_idempotency_requests(
                 )
             ).all()
             for record in records:
-                deleted_rows.append((record.scope, record.idempotency_key))
                 await session.delete(record)
 
-    for scope_value, key in deleted_rows:
-        await _safe_cache_delete(_cache_key(scope_value, key))
-
-    return len(deleted_rows)
+    return len(records)
 
 
 __all__ = [
