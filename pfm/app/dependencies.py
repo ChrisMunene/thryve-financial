@@ -6,8 +6,6 @@ Tests override these via app.dependency_overrides.
 """
 
 from collections.abc import Callable
-
-import redis.asyncio as aioredis
 from fastapi import Depends, Request, Security
 
 from app.auth.auth_context import AuthContext
@@ -55,6 +53,7 @@ def get_transaction_import_service(
 
 
 def get_redis_service(request: Request) -> RedisService:
+    """Return the application Redis service"""
     redis_service = getattr(request.app.state, "redis", None)
     if redis_service is None:
         raise RuntimeError("Redis service is not initialized on app.state")

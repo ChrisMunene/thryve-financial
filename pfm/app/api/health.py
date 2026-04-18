@@ -61,14 +61,7 @@ def _request_redis_service(request: Request) -> RedisService:
     return redis_service
 
 
-async def _ensure_started_redis(redis_service: RedisService) -> None:
-    if await redis_service.ensure_started():
-        return
-    raise RuntimeError("Redis is unavailable.")
-
-
 async def _assert_redis_ready(redis_service: RedisService) -> None:
-    await _ensure_started_redis(redis_service)
     await redis_service.round_trip(timeout_seconds=2.0)
 
 
@@ -132,10 +125,8 @@ async def _celery_queue_depths(redis_service: RedisService) -> dict[str, int]:
 
     from app.workers.celery_app import celery_app
 
-    await _ensure_started_redis(redis_service)
-
     queue_names = [queue.name for queue in celery_app.conf.task_queues]
-    redis = redis_service.client
+    redis = await redis_service.require_client()
 
     queue_depths: dict[str, int] = {}
     for queue_name in queue_names:

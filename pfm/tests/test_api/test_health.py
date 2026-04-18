@@ -34,8 +34,15 @@ class _LazyRedisService:
 
     async def round_trip(self, *, timeout_seconds: float = 2.0) -> None:
         self.round_trip_calls += 1
+        if not await self.ensure_started():
+            raise RuntimeError("Redis is unavailable.")
         if self._round_trip_error is not None:
             raise self._round_trip_error
+
+    async def require_client(self):
+        if not await self.ensure_started():
+            raise RuntimeError("Redis is unavailable.")
+        return self
 
     async def ping(self, *, timeout_seconds: float = 2.0) -> bool:
         self.ping_calls += 1
@@ -197,6 +204,21 @@ async def test_celery_health_check_surfaces_queue_depths(monkeypatch, fake_redis
     assert result.status == "healthy"
     assert result.workers == 2
     assert result.queues == {"default": 5, "high": 1, "low": 0}
+
+
+async def test_celery_health_check_reports_unhealthy_when_redis_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        health,
+        "_celery_worker_count",
+        lambda: 2,
+    )
+
+    redis_service = _LazyRedisService(ensure_started_result=False)
+
+    result = await health._celery_health_check(redis_service)
+
+    assert result.status == "unhealthy"
+    assert redis_service.ensure_started_calls == 1
 
 
 async def test_readiness_returns_200_when_dependencies_ready(app, client, monkeypatch):

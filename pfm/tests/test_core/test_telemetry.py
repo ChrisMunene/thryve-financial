@@ -352,6 +352,22 @@ def test_metrics_facade_validates_attributes_and_caches_instruments():
         )
 
 
+def test_metrics_facade_records_redis_service_events():
+    provider = _FakeMeterProvider(resource=None, metric_readers=[])
+    metrics = AppMetrics(provider)
+
+    metrics.record_redis_reconnect_attempt(source="ensure_started")
+    metrics.record_redis_reconnect_cooldown_skip(source="ensure_started")
+    metrics.record_redis_stopped_access(source="raw_client")
+
+    counter = provider.meter.created[MetricName.REDIS_SERVICE_EVENTS.value]
+    assert counter.calls == [
+        (1, {"event": "reconnect_attempt", "source": "ensure_started"}),
+        (1, {"event": "cooldown_skip", "source": "ensure_started"}),
+        (1, {"event": "stopped_access", "source": "raw_client"}),
+    ]
+
+
 def test_operation_span_filters_sensitive_and_null_attributes(monkeypatch):
     fake_tracer = _FakeTracer()
     monkeypatch.setattr(

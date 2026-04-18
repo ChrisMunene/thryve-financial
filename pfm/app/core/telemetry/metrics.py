@@ -21,6 +21,7 @@ class MetricName(StrEnum):
     OUTBOUND_REQUEST_DURATION = "http.client.duration"
     IDEMPOTENCY_REQUESTS = "idempotency.requests"
     IDEMPOTENCY_LEASE_STEALS = "idempotency.lease_steals"
+    REDIS_SERVICE_EVENTS = "redis.service.events"
     TASKS_DISPATCHED = "worker.tasks.dispatched"
     TASKS_IN_FLIGHT = "worker.tasks.in_flight"
 
@@ -64,6 +65,12 @@ METRIC_DEFINITIONS: dict[MetricName, MetricDefinition] = {
         name=MetricName.IDEMPOTENCY_LEASE_STEALS,
         kind=MetricKind.COUNTER,
         description="Count of expired idempotency leases that were reclaimed.",
+    ),
+    MetricName.REDIS_SERVICE_EVENTS: MetricDefinition(
+        name=MetricName.REDIS_SERVICE_EVENTS,
+        kind=MetricKind.COUNTER,
+        description="Count of Redis service lifecycle and recovery events.",
+        allowed_attributes=frozenset({"event", "source"}),
     ),
     MetricName.TASKS_DISPATCHED: MetricDefinition(
         name=MetricName.TASKS_DISPATCHED,
@@ -187,6 +194,15 @@ class AppMetrics:
     def record_idempotency_lease_steal(self) -> None:
         self.counter(MetricName.IDEMPOTENCY_LEASE_STEALS)
 
+    def record_redis_reconnect_attempt(self, *, source: str) -> None:
+        self._record_redis_service_event(event="reconnect_attempt", source=source)
+
+    def record_redis_reconnect_cooldown_skip(self, *, source: str) -> None:
+        self._record_redis_service_event(event="cooldown_skip", source=source)
+
+    def record_redis_stopped_access(self, *, source: str) -> None:
+        self._record_redis_service_event(event="stopped_access", source=source)
+
     def record_task_dispatch(self, *, task_name: str) -> None:
         self.counter(MetricName.TASKS_DISPATCHED, attributes={"task_name": task_name})
 
@@ -205,6 +221,15 @@ class AppMetrics:
                 f"not {expected_kind.value}"
             )
         return definition
+
+    def _record_redis_service_event(self, *, event: str, source: str) -> None:
+        self.counter(
+            MetricName.REDIS_SERVICE_EVENTS,
+            attributes={
+                "event": event,
+                "source": source,
+            },
+        )
 
     def _instrument_for(self, definition: MetricDefinition) -> Any:
         instrument = self._instruments.get(definition.name)

@@ -201,7 +201,7 @@ async def _get_or_create_limiter(
         try:
             bucket = RedisBucket.init(
                 [Rate(policy.limit, policy.window_seconds)],
-                redis_service.client,
+                redis_service.raw_client,
                 bucket_key=redis_service.key(
                     "pfm",
                     "rate_limit",
